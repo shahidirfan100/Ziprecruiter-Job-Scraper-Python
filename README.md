@@ -1,23 +1,24 @@
 # ZipRecruiter Jobs Scraper
 
-Extract and collect ZipRecruiter job listings into structured datasets for analysis, research, and automation. Gather job titles, companies, locations, salary information, full descriptions, and apply links at scale. This actor is built for fast, reliable job data collection workflows.
+Extract and collect ZipRecruiter job listings into structured datasets for analysis, research, and automation. Gather job titles, companies, locations, salary ranges, work-style labels, benefits, and apply links at scale. This actor is built for fast, reliable job data collection workflows.
 
 ## Features
 
-- **Comprehensive Job Data** — Collect detailed listing records including job content, compensation fields, and metadata.
+- **Structured Listing Data** — Collect job titles, companies, locations, salary ranges, work-style labels, benefits, and apply links.
 - **Flexible Search Inputs** — Start from a direct search URL or use keywords and location.
-- **Automatic Pagination** — Continue across result pages until you hit your limits.
+- **Automatic Pagination** — Continue across result batches until you hit your limits.
 - **Freshness Filtering** — Restrict results to recent postings using a day-range filter.
+- **Duplicate Handling** — Automatically removes repeated listings across overlapping result batches.
 - **Structured Exports** — Use JSON, CSV, Excel, and other dataset export formats.
 - **Automation Ready** — Run manually, on schedule, or through API integrations.
 
 ## Use Cases
 
 ### Recruitment Pipeline Enrichment
-Collect targeted job datasets by role and location to enrich recruiting workflows. Track openings from specific regions or categories and sync data downstream.
+Collect targeted job datasets by role and location to enrich recruiting workflows. Track openings from specific regions or categories and sync clean listing data downstream.
 
 ### Job Market Intelligence
-Analyze hiring demand by title, location, compensation range, and posting recency. Use the data for reporting, trend analysis, and competitive monitoring.
+Analyze hiring demand by title, location, compensation range, work style, and posting recency. Use the data for reporting, trend analysis, and competitive monitoring.
 
 ### Lead Generation for B2B Services
 Find companies actively hiring in your service niche and create prospect lists. Use job activity as an intent signal for outreach campaigns.
@@ -39,7 +40,7 @@ Feed datasets into warehouse or BI tools for recurring reporting. Monitor role d
 | `location` | String | No | `"United States"` | Target location for search results. |
 | `maxJobs` | Integer | No | `20` | Maximum number of jobs to collect. Use `0` for unlimited until other limits are reached. |
 | `maxPages` | Integer | No | `10` | Maximum number of result pages to process. |
-| `scrapeMode` | String | No | `"listing_only"` | `listing_only` for fastest extraction, or `listing_with_details` for richer detail fields (slower). |
+| `scrapeMode` | String | No | `"listing_only"` | `listing_only` is the native mode. `listing_with_details` is accepted for compatibility and currently returns the same listing-level dataset. |
 | `daysBack` | String | No | `"any"` | Posting recency filter. Allowed values: `any`, `1`, `3`, `7`, `14`, `30`. |
 | `proxyConfiguration` | Object | No | Residential proxy preset | Proxy configuration for reliable collection. |
 
@@ -53,49 +54,24 @@ Each dataset item contains job listing data like:
 |-------|------|-------------|
 | `title` | String | Job title. |
 | `company` | String | Company display name. |
-| `companyCanonicalName` | String | Canonical company name when available. |
-| `companyId` | String | Company identifier when available. |
-| `companyUrl` | String | Company page URL. |
-| `companyLogoUrl` | String | Company logo URL. |
 | `location` | String | Display location text. |
-| `locationCity` | String | City value. |
-| `locationState` | String | State value. |
-| `locationStateCode` | String | State code value. |
-| `locationCountry` | String | Country value. |
-| `locationCountryCode` | String | Country code value. |
 | `isRemote` | Boolean | Indicates remote classification. |
-| `locationTypes` | Array | Location type labels. |
-| `employmentTypes` | Array | Employment type labels. |
-| `jobType` | String | Combined employment type string. |
+| `locationTypes` | String | Work style labels such as `Remote`, `Hybrid`, or `On-site`. |
+| `locationType` | String | Joined work style summary. |
+| `employmentTypes` | String | Employment type labels such as `Full-time` or `Contract`. |
+| `jobType` | String | Combined job type summary returned with the listing. |
 | `salary` | String | Human-readable salary summary. |
-| `salaryMin` | Number | Minimum salary when available. |
-| `salaryMax` | Number | Maximum salary when available. |
-| `salaryMinAnnual` | Number | Annualized minimum salary when available. |
-| `salaryMaxAnnual` | Number | Annualized maximum salary when available. |
-| `salaryInterval` | String | Salary interval value. |
-| `salaryCurrency` | String | Salary currency code. |
-| `postedDate` | String | Posting date value. |
-| `postedAtUtc` | String | UTC posting timestamp. |
-| `rollingPostedAtUtc` | String | Rolling UTC posting timestamp. |
-| `isActive` | Boolean | Listing active flag when available. |
-| `url` | String | Job URL. |
-| `externalApplyUrl` | String | External apply URL when available. |
-| `applyButtonType` | String | Apply button type value. |
-| `applyDestination` | String | Apply destination value. |
-| `applyStatus` | String/Null | Apply status value when available. |
-| `listingKey` | String | Listing key identifier. |
-| `matchId` | String | Match identifier. |
-| `jobId` | String | Job identifier. |
-| `openSeatId` | String | Open seat identifier when available. |
-| `description` | String | Full job description text. |
-| `shortDescription` | String | Short listing summary text. |
-| `htmlDescription` | String | Rich description content when available. |
+| `salaryMinAnnual` | Number | Minimum annual salary when available. |
+| `salaryMaxAnnual` | Number | Maximum annual salary when available. |
+| `companyLogoUrl` | String | Company logo URL when available. |
+| `benefits` | String | Benefits summary when available. |
+| `daysAgo` | Number | Age of the listing in days. |
+| `url` | String | Job redirect URL. |
 | `searchQuery` | String | Input keyword used in the run. |
 | `searchLocation` | String | Input location used in the run. |
-| `page` | Number | Results page number. |
+| `page` | Number | Result batch number processed by the actor. |
+| `offset` | Number | Offset used for the result batch request. |
 | `scrapedAt` | String | Extraction timestamp. |
-| `rawCard` | Object | Raw listing payload. |
-| `rawDetails` | Object | Raw detailed payload. |
 
 ---
 
@@ -138,7 +114,7 @@ Focus on fresh jobs and use proxy settings:
     "daysBack": "7",
     "maxJobs": 200,
     "maxPages": 50,
-    "scrapeMode": "listing_with_details",
+    "scrapeMode": "listing_only",
     "proxyConfiguration": {
         "useApifyProxy": true,
         "apifyProxyGroups": ["RESIDENTIAL"],
@@ -153,22 +129,24 @@ Focus on fresh jobs and use proxy settings:
 
 ```json
 {
-    "title": "Software Engineer, Observability",
-    "company": "CoreWeave",
-    "location": "New York, NY US",
-    "jobType": "Full-time",
-    "salary": "$109,000 - $145,000 / year",
-    "postedAtUtc": "2026-02-05T17:18:00Z",
-    "url": "https://www.ziprecruiter.com/c/CoreWeave/Job/Software-Engineer,-Observability/-in-New-York,NY?jid=example",
-    "externalApplyUrl": "https://coreweave.com/careers/jobs/example",
-    "listingKey": "exampleListingKey",
-    "matchId": "exampleMatchId",
+    "title": "Senior Software Engineer",
+    "company": "Example Company",
+    "location": "Austin, Texas",
     "isRemote": false,
-    "description": "We are looking for a software engineer to build and scale observability services...",
+    "locationTypes": "On-site",
+    "jobType": "Full-time · On-site",
+    "salary": "$120,000 - $150,000 / year",
+    "salaryMinAnnual": 120000,
+    "salaryMaxAnnual": 150000,
+    "companyLogoUrl": "https://www.ziprecruiter.com/svc/fotomat/public-nosensitive-ziprecruiter-logos/company/example.png",
+    "benefits": "Medical, Vision, Dental, Paid time off",
+    "daysAgo": 1,
+    "url": "https://www.ziprecruiter.com/job-redirect?match_token=example",
     "searchQuery": "software engineer",
-    "searchLocation": "New York, NY",
+    "searchLocation": "United States",
     "page": 1,
-    "scrapedAt": "2026-02-08T14:15:28.000Z"
+    "offset": 0,
+    "scrapedAt": "2026-06-12T11:00:00.000Z"
 }
 ```
 
@@ -191,6 +169,10 @@ Focus on fresh jobs and use proxy settings:
 ### Keep Proxy Enabled
 - Use residential proxy settings for stronger reliability.
 - Keep proxy configuration consistent for scheduled runs.
+
+### Expect Listing-Level Coverage
+- Some listings do not expose salary, logo, or benefits details.
+- The actor removes empty values so your dataset stays cleaner.
 
 ### Schedule for Monitoring
 - Run daily or hourly schedules to detect new listings quickly.
@@ -229,8 +211,8 @@ Set `maxJobs` to your target value. If set to `0`, collection continues until pa
 ### Can I collect only recent jobs?
 Yes. Use `daysBack` with values like `1`, `3`, `7`, `14`, or `30`.
 
-### Why are some fields empty?
-Some listings do not expose every field. Missing values are returned as empty or null depending on field type.
+### Why are some fields missing?
+Some listings do not expose salary, benefits, or company logo details. Empty values are automatically removed from the dataset.
 
 ### Can I automate this actor?
 Yes. You can run it on schedules, call it through API, and send results to downstream tools.
