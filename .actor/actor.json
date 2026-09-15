@@ -4,10 +4,7 @@
     "title": "ZipRecruiter Jobs Scraper",
     "description": "Extract job listings from ZipRecruiter with flexible search options. Get structured data including titles, companies, locations, salaries, job types, descriptions, and apply links for job market analysis, recruitment automation, and research workflows.",
     "version": "1.0",
-    "categories": [
-        "BUSINESS",
-        "JOBS"
-    ],
+    "categories": ["BUSINESS", "JOBS"],
     "meta": {
         "templateId": "ziprecruiter-jobs-scraper",
         "generatedBy": "GPT-5.5"

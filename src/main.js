@@ -1,48 +1,41 @@
-import { readFile } from 'node:fs/promises';
-
 import { Actor, log } from 'apify';
+import { launchOptions as camoufoxLaunchOptions } from 'camoufox-js';
+import { firefox } from 'playwright';
+
+import {
+    adaptWebCard,
+    asArray,
+    buildJobIdentity,
+    extractEmbeddedJson,
+    extractNextFlightData,
+    hasValue,
+    normalizeInputString,
+    normalizeJobRecord,
+    resolveEffectiveSearch,
+    sanitizeRecordForDataset,
+} from './actor-utils.js';
 
 await Actor.init();
 
 const CONFIG = {
-    MCP_ENDPOINT: 'https://api.ziprecruiter.com/mcp',
-    MCP_PAGE_SIZE: 5,
+    DEFAULT_MAX_JOBS: 20,
     DEFAULT_MAX_PAGES: 10,
     MAX_PAGES_HARD_LIMIT: 200,
-    MAX_EMPTY_BATCHES: 3,
-    REQUEST_TIMEOUT_MS: 30000,
-    REQUEST_DELAY_MS: 400,
-    RETRY_DELAY_MS: 2000,
-    MAX_MCP_RETRIES: 3,
+    NAVIGATION_TIMEOUT_MS: 45000,
+    JSON_WAIT_MS: 15000,
+    REQUEST_DELAY_MS: 250,
 };
 
-const INPUT_KEYS = ['searchUrl', 'searchQuery', 'location', 'maxJobs', 'maxPages', 'daysBack', 'proxyConfiguration', 'scrapeMode'];
-
 const stats = {
-    batchesProcessed: 0,
+    pagesProcessed: 0,
     recordsPushed: 0,
     duplicatesSkipped: 0,
     missingSalary: 0,
     missingBenefits: 0,
     missingCompanyLogo: 0,
-    emptyBatches: 0,
     warnings: [],
     startTime: Date.now(),
 };
-
-const seenJobKeys = new Set();
-
-function safeJsonParse(value, fallback = null) {
-    try {
-        return JSON.parse(value);
-    } catch {
-        return fallback;
-    }
-}
-
-function asArray(value) {
-    return Array.isArray(value) ? value : [];
-}
 
 function sleep(ms) {
     return new Promise((resolve) => {
@@ -50,524 +43,360 @@ function sleep(ms) {
     });
 }
 
-function hasValue(value) {
-    if (value === null || value === undefined) return false;
-    if (typeof value === 'string') return value.trim().length > 0;
-    if (Array.isArray(value)) return value.length > 0;
-    if (typeof value === 'object') return Object.keys(value).length > 0;
-    return true;
+function configuredProxyGroups(proxyInput) {
+    return proxyInput?.groups || proxyInput?.apifyProxyGroups || [];
 }
 
-async function readJsonFileIfExists(path, fallback = {}) {
-    try {
-        const content = await readFile(path, 'utf8');
-        return safeJsonParse(content, fallback);
-    } catch {
-        return fallback;
-    }
+function proxyInputForAttempt(proxyInput, attempt) {
+    if (attempt === 1 || !proxyInput || Array.isArray(proxyInput.proxyUrls)) return proxyInput;
+    const groups = configuredProxyGroups(proxyInput).map((group) => String(group).toUpperCase());
+    if (!groups.includes('UNBLOCKER')) return proxyInput;
+
+    const residentialInput = { ...proxyInput, apifyProxyGroups: ['RESIDENTIAL'] };
+    delete residentialInput.groups;
+    return residentialInput;
 }
 
-function getSchemaFallback(schema, key) {
-    const field = schema?.properties?.[key];
-    if (!field || typeof field !== 'object') return undefined;
-    if (field.prefill !== undefined) return field.prefill;
-    if (field.default !== undefined) return field.default;
-    return undefined;
+function proxyInputForSearch(proxyInput, effectiveSearch) {
+    const location = effectiveSearch.location.toLowerCase();
+    const isUsSearch = /united states|\busa\b|\bunited states of america\b/.test(location);
+    const hasCountry = proxyInput?.apifyProxyCountry || proxyInput?.countryCode;
+    const usesApifyProxy = proxyInput?.useApifyProxy === true || configuredProxyGroups(proxyInput).length > 0;
+    if (!isUsSearch || hasCountry || !usesApifyProxy) return proxyInput;
+    return { ...proxyInput, apifyProxyCountry: 'US' };
 }
 
-async function resolveInputWithFallbacks() {
-    const runtimeInput = (await Actor.getInput()) || {};
-    const schema = await readJsonFileIfExists('.actor/input_schema.json', {});
-    const localInput = await readJsonFileIfExists('INPUT.json', {});
+async function createBrowserProxyUrl(proxyInput, attempt = 1) {
+    const isCloudRun = Actor.isAtHome();
+    const groups = configuredProxyGroups(proxyInput);
+    const requestedApifyProxy = proxyInput?.useApifyProxy === true || groups.length > 0;
+    const hasCustomProxyUrls = Array.isArray(proxyInput?.proxyUrls) && proxyInput.proxyUrls.length > 0;
 
-    const runtimeHasSearchFilters = hasValue(runtimeInput.searchQuery) || hasValue(runtimeInput.location);
-    const runtimeHasSearchUrl = hasValue(runtimeInput.searchUrl);
-    const userProvidedAny = Object.values(runtimeInput).some((value) => hasValue(value));
-    const resolvedInput = { ...runtimeInput };
-    const fallbackSources = {};
-
-    for (const key of INPUT_KEYS) {
-        if (hasValue(resolvedInput[key])) continue;
-
-        if (key === 'searchUrl' && runtimeHasSearchFilters && !runtimeHasSearchUrl) continue;
-
-        const schemaFallback = getSchemaFallback(schema, key);
-        if (hasValue(schemaFallback)) {
-            resolvedInput[key] = schemaFallback;
-            fallbackSources[key] = 'input_schema';
-            continue;
+    if ((!isCloudRun && requestedApifyProxy && !hasCustomProxyUrls) || (!requestedApifyProxy && !hasCustomProxyUrls)) {
+        if (requestedApifyProxy && !isCloudRun) {
+            log.warning(
+                'Apify Proxy was requested outside Apify; running without it. Use an Apify run or provide custom proxy URLs.',
+            );
         }
-
-        if (hasValue(localInput[key])) {
-            resolvedInput[key] = localInput[key];
-            fallbackSources[key] = 'INPUT.json';
-        }
+        return undefined;
     }
 
-    return { resolvedInput, fallbackSources, userProvidedAny };
+    const proxyConfiguration = await Actor.createProxyConfiguration(proxyInput);
+    if (!proxyConfiguration) return undefined;
+
+    const usesUnblocker = groups.some((group) => String(group).toUpperCase() === 'UNBLOCKER');
+    const sessionId = usesUnblocker ? undefined : `ziprecruiter_${Date.now()}_${attempt}`;
+    const proxyUrl = await proxyConfiguration.newUrl(sessionId);
+    let proxyType = 'configured proxy';
+    if (usesUnblocker) proxyType = 'Unblocker';
+    else if (groups.some((group) => String(group).toUpperCase() === 'RESIDENTIAL')) proxyType = 'Residential';
+    log.info(`Using Apify ${proxyType} for the browser context.`);
+    return proxyUrl;
 }
 
-function normalizeInputString(value) {
-    return typeof value === 'string' ? value.trim() : '';
-}
-
-function decodeUrlFragment(value) {
-    if (!value) return '';
-
-    return decodeURIComponent(String(value))
-        .replace(/\+/g, ' ')
-        .replace(/-/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-}
-
-function parseSearchUrl(searchUrl) {
-    if (!searchUrl) {
-        return {
-            searchQuery: '',
-            location: '',
-            daysBack: 'any',
-        };
+function webPageUrl(effectiveSearch, page) {
+    if (effectiveSearch.searchUrl) {
+        const url = new URL(effectiveSearch.searchUrl);
+        if (page > 1) url.searchParams.set('page', String(page));
+        return url.toString();
     }
 
-    try {
-        const parsed = new URL(searchUrl);
-        const pathnameParts = parsed.pathname.split('/').filter(Boolean);
+    const params = new URLSearchParams();
+    if (effectiveSearch.searchQuery) params.set('search', effectiveSearch.searchQuery);
+    if (effectiveSearch.location) params.set('location', effectiveSearch.location);
+    if (/^\d+$/.test(String(effectiveSearch.daysBack))) params.set('days_ago', String(effectiveSearch.daysBack));
+    if (page > 1) params.set('page', String(page));
+    return `https://www.ziprecruiter.com/jobs-search?${params.toString()}`;
+}
 
-        let searchQuery = normalizeInputString(parsed.searchParams.get('search') || parsed.searchParams.get('q') || '');
-        let location = normalizeInputString(parsed.searchParams.get('location') || '');
-        const daysBack = normalizeInputString(parsed.searchParams.get('days') || 'any') || 'any';
-
-        if (!searchQuery && pathnameParts[0]?.toLowerCase() === 'jobs' && pathnameParts[1]) {
-            searchQuery = decodeUrlFragment(pathnameParts[1]);
+async function readPageScripts(page) {
+    const deadline = Date.now() + CONFIG.JSON_WAIT_MS;
+    let latestScripts = [];
+    while (Date.now() < deadline) {
+        try {
+            latestScripts = await page.evaluate(() =>
+                [...document.scripts].map((script) => script.textContent?.trim() || '').filter(Boolean),
+            );
+            if (
+                latestScripts.some(
+                    (text) => text.includes('hydrateJobCardsResponse') || text.includes('serializedJobCardsData'),
+                )
+            )
+                return latestScripts;
+        } catch (error) {
+            if (!/execution context was destroyed|navigation/i.test(error.message)) throw error;
         }
+        await page.waitForTimeout(500);
+    }
+    return latestScripts;
+}
 
-        if (!location) {
-            const locationSegment = pathnameParts.find((part) => part.toLowerCase().startsWith('-in-'));
-            if (locationSegment) {
-                location = decodeUrlFragment(locationSegment.slice(4));
+async function readDomJobCards(page) {
+    return page.evaluate(() => {
+        const jsonLdItems = [...document.querySelectorAll('script[type="application/ld+json"]')].flatMap((script) => {
+            try {
+                const value = JSON.parse(script.textContent || '{}');
+                return value?.['@type'] === 'ItemList' ? value.itemListElement || [] : [];
+            } catch {
+                return [];
             }
-        }
+        });
+        const urlsByTitle = new Map(jsonLdItems.map((item) => [item.name, item.url]));
+        const seen = new Set();
 
-        return { searchQuery, location, daysBack };
-    } catch {
-        return {
-            searchQuery: '',
-            location: '',
-            daysBack: 'any',
-        };
-    }
-}
+        return [...document.querySelectorAll('article[id^="job-card-"]')]
+            .map((article) => {
+                const listingKey = article.id.slice('job-card-'.length);
+                if (!listingKey || seen.has(listingKey)) return null;
+                seen.add(listingKey);
 
-function resolveEffectiveSearch(input) {
-    const rawSearchUrl = normalizeInputString(input.searchUrl);
-    const rawSearchQuery = normalizeInputString(input.searchQuery);
-    const rawLocation = normalizeInputString(input.location);
+                const title = article.querySelector('[data-testid="serp-job-card-title"]')?.textContent?.trim() || '';
+                const company = article.querySelector('[data-testid="job-card-company"]')?.textContent?.trim() || '';
+                const location = article.querySelector('[data-testid="job-card-location"]')?.textContent?.trim() || '';
+                const locationTypes = [...article.innerText.matchAll(/(?:·|•)\s*(Remote|Hybrid|On-site)/gi)].map(
+                    (match) => match[1],
+                );
+                const logoUrl = article.querySelector('img')?.src || '';
+                const jobUrl = urlsByTitle.get(title) || `https://www.ziprecruiter.com/jobs//j?lvk=${listingKey}`;
 
-    const hasSearchUrl = Boolean(rawSearchUrl);
-    const hasSearchFilters = Boolean(rawSearchQuery || rawLocation);
-    const useSearchUrl = hasSearchUrl && !hasSearchFilters;
-
-    if (useSearchUrl) {
-        const parsedFromUrl = parseSearchUrl(rawSearchUrl);
-        return {
-            searchUrl: rawSearchUrl,
-            searchQuery: parsedFromUrl.searchQuery,
-            location: parsedFromUrl.location,
-            daysBack: parsedFromUrl.daysBack || input.daysBack || 'any',
-        };
-    }
-
-    return {
-        searchUrl: '',
-        searchQuery: rawSearchQuery,
-        location: rawLocation,
-        daysBack: input.daysBack || 'any',
-    };
-}
-
-function daysBackToMinutes(daysBack) {
-    const numericDays = Number(daysBack);
-    if (!Number.isFinite(numericDays) || numericDays <= 0) return undefined;
-    return numericDays * 24 * 60;
-}
-
-function formatSalary(minAnnual, maxAnnual) {
-    if (!Number.isFinite(minAnnual) && !Number.isFinite(maxAnnual)) return '';
-
-    const formatter = new Intl.NumberFormat('en-US', {
-        style: 'currency',
-        currency: 'USD',
-        maximumFractionDigits: 0,
+                return {
+                    listingKey,
+                    title,
+                    company: { name: company },
+                    location: { displayName: location },
+                    locationTypes,
+                    isRemote: locationTypes.some((value) => /remote/i.test(value)),
+                    companyLogo: { logoUrl },
+                    rawCanonicalZipJobPageUrl: jobUrl,
+                };
+            })
+            .filter(Boolean);
     });
-
-    if (Number.isFinite(minAnnual) && Number.isFinite(maxAnnual)) {
-        return `${formatter.format(minAnnual)} - ${formatter.format(maxAnnual)} / year`;
-    }
-
-    if (Number.isFinite(minAnnual)) {
-        return `${formatter.format(minAnnual)}+ / year`;
-    }
-
-    return `Up to ${formatter.format(maxAnnual)} / year`;
 }
 
-function splitJobType(jobTypeText, isRemote) {
-    const parts = String(jobTypeText || '')
-        .split('·')
-        .map((part) => part.trim())
-        .filter(Boolean);
-
-    const employmentTypes = parts[0] ? [parts[0]] : [];
-    const locationTypes = [];
-
-    if (isRemote || parts.some((part) => /remote/i.test(part))) {
-        locationTypes.push('Remote');
-    } else if (parts.some((part) => /hybrid/i.test(part))) {
-        locationTypes.push('Hybrid');
-    } else if (parts.some((part) => /on[\s-]?site/i.test(part))) {
-        locationTypes.push('On-site');
-    }
-
-    return {
-        employmentTypes,
-        locationTypes,
-        jobType: parts.join(' · '),
-    };
-}
-
-function buildDedupeKey(result) {
-    return [
-        normalizeInputString(result.title).toLowerCase(),
-        normalizeInputString(result.company).toLowerCase(),
-        normalizeInputString(result.location).toLowerCase(),
-        normalizeInputString(result.job_type).toLowerCase(),
-        Number.isFinite(result.salary?.min_annual) ? result.salary.min_annual : '',
-        Number.isFinite(result.salary?.max_annual) ? result.salary.max_annual : '',
-    ].join('|');
-}
-
-function sanitizeRecordForDataset(record) {
-    const sanitized = {};
-
-    for (const [key, value] of Object.entries(record)) {
-        if (value === null || value === undefined) continue;
-
-        if (Array.isArray(value)) {
-            const cleaned = [...new Set(value
-                .map((item) => String(item).trim())
-                .filter(Boolean))];
-
-            if (cleaned.length) sanitized[key] = cleaned.join(', ');
-            continue;
+function parsePagePayload(scriptTexts) {
+    try {
+        return extractEmbeddedJson(scriptTexts);
+    } catch {
+        try {
+            return extractNextFlightData(scriptTexts);
+        } catch {
+            return null;
         }
+    }
+}
 
-        if (typeof value === 'string') {
-            const trimmed = value.trim();
-            if (trimmed) sanitized[key] = trimmed;
-            continue;
-        }
-
-        sanitized[key] = value;
+async function readPageData(page, url) {
+    let response;
+    try {
+        response = await page.goto(url, {
+            waitUntil: 'commit',
+            timeout: CONFIG.NAVIGATION_TIMEOUT_MS,
+        });
+    } catch (error) {
+        throw new Error(`ZipRecruiter navigation did not complete: ${error.message}`);
     }
 
-    return sanitized;
-}
+    const status = response?.status() || 0;
+    await page.waitForLoadState('domcontentloaded', { timeout: CONFIG.NAVIGATION_TIMEOUT_MS }).catch(() => undefined);
+    const scriptTexts = await readPageScripts(page);
+    const data = parsePagePayload(scriptTexts);
+    if (data) {
+        if (status >= 400) {
+            log.warning(`ZipRecruiter returned HTTP ${status} with a usable job payload; continuing.`);
+        }
+        return { data, status };
+    }
 
-async function pushRecordsSafely(records) {
-    if (!records.length) return 0;
-
-    const sanitizedRecords = records.map(sanitizeRecordForDataset).filter((record) => Object.keys(record).length > 0);
-    if (!sanitizedRecords.length) return 0;
-
-    await Actor.pushData(sanitizedRecords);
-    return sanitizedRecords.length;
-}
-
-async function mcpRequest(body) {
-    for (let attempt = 1; attempt <= CONFIG.MAX_MCP_RETRIES; attempt += 1) {
-        const response = await fetch(CONFIG.MCP_ENDPOINT, {
-            method: 'POST',
-            headers: {
-                Accept: 'application/json, text/event-stream',
-                'Content-Type': 'application/json',
+    const domCards = await readDomJobCards(page).catch(() => []);
+    if (domCards.length) {
+        log.warning('ZipRecruiter did not expose a structured payload; using rendered job cards as a fallback.');
+        return {
+            data: {
+                hydrateJobCardsResponse: { jobCards: domCards },
+                page: Number(new URL(url).searchParams.get('page')) || 1,
+                maxPages: Number(new URL(url).searchParams.get('page')) || 1,
             },
-            body: JSON.stringify(body),
-            signal: AbortSignal.timeout(CONFIG.REQUEST_TIMEOUT_MS),
+            status,
+        };
+    }
+
+    const title = await page.title().catch(() => '');
+    const blocked = /captcha|access denied|just a moment|challenge|robot/i.test(`${title} ${scriptTexts.join(' ')}`);
+    if (blocked || status >= 400) {
+        throw new Error(
+            `ZipRecruiter page was blocked or incomplete (HTTP ${status || 'unknown'}, title: ${title || 'unknown'}).`,
+        );
+    }
+    throw new Error('ZipRecruiter page did not contain a supported job payload.');
+}
+
+async function runBrowserSession(proxyInput, effectiveSearch, targetJobs, maxPages) {
+    const maxAttempts = 2;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        const attemptProxyInput = proxyInputForAttempt(proxyInput, attempt);
+        if (attempt > 1 && attemptProxyInput !== proxyInput) {
+            log.warning('Retrying ZipRecruiter with a fresh Residential proxy route.');
+        }
+        const proxyUrl = await createBrowserProxyUrl(attemptProxyInput, attempt);
+        const browser = await firefox.launch(
+            await camoufoxLaunchOptions({
+                headless: true,
+                ...(proxyUrl ? { proxy: proxyUrl } : {}),
+                humanize: true,
+                block_webrtc: true,
+                enable_cache: true,
+            }),
+        );
+        const context = await browser.newContext();
+        const page = await context.newPage();
+
+        await page.route('**/*', async (route) => {
+            const resourceType = route.request().resourceType();
+            const requestUrl = route.request().url();
+            if (
+                resourceType === 'media' ||
+                /google-analytics|googletagmanager|doubleclick|facebook\.net/i.test(requestUrl)
+            ) {
+                await route.abort();
+                return;
+            }
+            await route.continue();
         });
 
-        const text = await response.text();
-        const payload = safeJsonParse(text, null);
-
-        if (response.ok && !payload?.error) {
-            return payload;
+        try {
+            await scrapePages(page, effectiveSearch, targetJobs, maxPages);
+            return;
+        } catch (error) {
+            const canRetry = attempt < maxAttempts && stats.recordsPushed === 0;
+            if (!canRetry) throw error;
+            log.warning(`Browser/proxy attempt ${attempt} failed: ${error.message}. Retrying with a fresh route.`);
+        } finally {
+            await page.close().catch(() => undefined);
+            await context.close().catch(() => undefined);
+            await browser.close().catch(() => undefined);
         }
-
-        const message = payload?.error?.message || text || `HTTP ${response.status}`;
-        const isRateLimit = response.status === 429 || /too many requests|429/i.test(message);
-        const isLastAttempt = attempt === CONFIG.MAX_MCP_RETRIES;
-
-        if (!isRateLimit || isLastAttempt) {
-            throw new Error(message);
-        }
-
-        log.warning(`MCP request rate limited. Retrying attempt ${attempt + 1}/${CONFIG.MAX_MCP_RETRIES}.`);
-        await sleep(CONFIG.RETRY_DELAY_MS * attempt);
     }
-
-    return null;
 }
 
-async function initializeMcpClient() {
-    await mcpRequest({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'initialize',
-        params: {
-            protocolVersion: '2025-03-26',
-            capabilities: {},
-            clientInfo: {
-                name: 'ziprecruiter-apify-actor',
-                version: '1.0.0',
-            },
-        },
-    });
-
-    await mcpRequest({
-        jsonrpc: '2.0',
-        method: 'notifications/initialized',
-        params: {},
-    });
+async function pushRecords(records) {
+    const cleanRecords = records.map(sanitizeRecordForDataset).filter((record) => Object.keys(record).length > 0);
+    if (!cleanRecords.length) return 0;
+    await Actor.pushData(cleanRecords);
+    return cleanRecords.length;
 }
 
-async function searchJobsViaMcp(args, requestId) {
-    const payload = await mcpRequest({
-        jsonrpc: '2.0',
-        id: requestId,
-        method: 'tools/call',
-        params: {
-            name: 'search_jobs',
-            arguments: args,
-        },
-    });
+async function scrapePages(page, effectiveSearch, targetJobs, maxPages) {
+    const seenJobKeys = new Set();
+    let currentPage = 1;
 
-    return payload?.result?.structuredContent || {};
-}
+    while (currentPage <= maxPages && (!Number.isFinite(targetJobs) || stats.recordsPushed < targetJobs)) {
+        const url = webPageUrl(effectiveSearch, currentPage);
+        log.info(`Opening ZipRecruiter result page ${currentPage}/${maxPages}.`);
+        const { data } = await readPageData(page, url);
+        const cards = asArray(data.hydrateJobCardsResponse?.jobCards);
+        const details = data.getJobDetailsResponse?.jobDetails || null;
+        stats.pagesProcessed += 1;
 
-function buildSearchArgs(effectiveSearch, offset) {
-    const args = { offset };
+        if (!cards.length) {
+            log.info(`Result page ${currentPage} returned no job cards.`);
+            break;
+        }
 
-    if (effectiveSearch.searchQuery) args.job_role = effectiveSearch.searchQuery;
-    if (effectiveSearch.location) args.location = effectiveSearch.location;
+        const records = [];
+        for (const [index, card] of cards.entries()) {
+            const adapted = adaptWebCard(card, index === 0 ? details : null);
+            if (!hasValue(adapted.title) && !hasValue(adapted.job_redirect_url) && !hasValue(adapted.listing_key))
+                continue;
+            const identity = buildJobIdentity(adapted);
+            if (!identity || seenJobKeys.has(identity)) {
+                stats.duplicatesSkipped += 1;
+                continue;
+            }
+            seenJobKeys.add(identity);
 
-    const maxPostedMinutesAgo = daysBackToMinutes(effectiveSearch.daysBack);
-    if (maxPostedMinutesAgo) args.max_posted_minutes_ago = maxPostedMinutesAgo;
+            if (!hasValue(adapted.salary?.min) && !hasValue(adapted.salary?.max)) stats.missingSalary += 1;
+            if (!hasValue(adapted.benefits)) stats.missingBenefits += 1;
+            if (!hasValue(adapted.company_logo)) stats.missingCompanyLogo += 1;
+            records.push(
+                normalizeJobRecord(adapted, {
+                    searchQuery: effectiveSearch.searchQuery,
+                    searchLocation: effectiveSearch.location,
+                    page: currentPage,
+                    offset: currentPage === 1 ? 0 : null,
+                }),
+            );
+        }
 
-    return args;
-}
+        const remaining = Number.isFinite(targetJobs) ? targetJobs - stats.recordsPushed : Number.POSITIVE_INFINITY;
+        const pushed = await pushRecords(records.slice(0, Math.max(remaining, 0)));
+        stats.recordsPushed += pushed;
+        log.info(
+            `Page ${currentPage}: saved ${pushed} jobs; total ${stats.recordsPushed}${Number.isFinite(targetJobs) ? `/${targetJobs}` : ''}.`,
+        );
 
-function normalizeJobRecord(result, context) {
-    const minAnnual = Number.isFinite(result.salary?.min_annual) ? result.salary.min_annual : null;
-    const maxAnnual = Number.isFinite(result.salary?.max_annual) ? result.salary.max_annual : null;
-    const { employmentTypes, locationTypes, jobType } = splitJobType(result.job_type, Boolean(result.is_remote));
-
-    return {
-        title: result.title || '',
-        company: result.company || '',
-        location: result.location || '',
-        isRemote: Boolean(result.is_remote),
-        jobType,
-        employmentTypes,
-        locationTypes,
-        locationType: locationTypes.join(', '),
-        salary: formatSalary(minAnnual, maxAnnual),
-        salaryMinAnnual: minAnnual,
-        salaryMaxAnnual: maxAnnual,
-        companyLogoUrl: result.company_logo || '',
-        url: result.job_redirect_url || '',
-        benefits: result.benefits || '',
-        daysAgo: Number.isFinite(result.days_ago) ? result.days_ago : null,
-        searchQuery: context.searchQuery,
-        searchLocation: context.searchLocation,
-        page: context.page,
-        offset: context.offset,
-        scrapedAt: new Date().toISOString(),
-    };
+        const reportedPage = Number(data.page) || currentPage;
+        const reportedMaxPages = Number(data.maxPages) || maxPages;
+        if (reportedPage >= reportedMaxPages || cards.length === 0) break;
+        currentPage += 1;
+        await sleep(CONFIG.REQUEST_DELAY_MS);
+    }
 }
 
 try {
-    const { resolvedInput: input, fallbackSources, userProvidedAny } = await resolveInputWithFallbacks();
+    const input = (await Actor.getInput()) || {};
     const effectiveSearch = resolveEffectiveSearch(input);
-
-    if (!effectiveSearch.searchQuery && !effectiveSearch.location) {
-        throw new Error('Missing search input. Provide searchQuery, location, or a parseable searchUrl.');
+    if (!effectiveSearch.searchUrl && !effectiveSearch.searchQuery && !effectiveSearch.location) {
+        throw new Error('Missing search input. Provide searchUrl, searchQuery, or location.');
     }
 
-    const maxJobsInput = Number(input.maxJobs ?? 20);
+    const maxJobsInput = Number(input.maxJobs ?? CONFIG.DEFAULT_MAX_JOBS);
     const targetJobs = maxJobsInput > 0 ? maxJobsInput : Number.POSITIVE_INFINITY;
     const maxPages = Math.min(
         Math.max(Number(input.maxPages) || CONFIG.DEFAULT_MAX_PAGES, 1),
         CONFIG.MAX_PAGES_HARD_LIMIT,
     );
     const scrapeMode = normalizeInputString(input.scrapeMode) || 'listing_only';
+    const configuredProxyInput = input.proxyConfiguration ?? {
+        useApifyProxy: true,
+        apifyProxyGroups: ['UNBLOCKER'],
+    };
+    const proxyInput = proxyInputForSearch(configuredProxyInput, effectiveSearch);
 
-    log.info('Starting ZipRecruiter actor in MCP search mode', {
+    log.info('Starting ZipRecruiter Camoufox browser run', {
         searchQuery: effectiveSearch.searchQuery || null,
         location: effectiveSearch.location || null,
         usingSearchUrl: Boolean(effectiveSearch.searchUrl),
         maxJobs: Number.isFinite(targetJobs) ? targetJobs : 0,
         maxPages,
         scrapeMode,
-        userProvidedInput: userProvidedAny,
-        fallbackSources,
     });
-
     if (scrapeMode === 'listing_with_details') {
-        log.warning('listing_with_details requested, but the selected MCP endpoint currently exposes listing-level data only.');
+        log.warning(
+            'listing_with_details is retained for compatibility; the actor captures descriptions when available in the listing payload.',
+        );
     }
 
-    if (hasValue(input.proxyConfiguration)) {
-        log.info('Proxy configuration was provided but is not required for the selected MCP endpoint.');
-    }
-
-    await initializeMcpClient();
-
-    let offset = 0;
-    let page = 1;
-    let consecutiveEmptyBatches = 0;
-
-    while (page <= maxPages && (Number.isFinite(targetJobs) ? stats.recordsPushed < targetJobs : true)) {
-        const args = buildSearchArgs(effectiveSearch, offset);
-        const remainingSlots = Number.isFinite(targetJobs)
-            ? Math.max(targetJobs - stats.recordsPushed, 0)
-            : Number.POSITIVE_INFINITY;
-
-        if (remainingSlots === 0) break;
-
-        const searchPayload = await searchJobsViaMcp(args, page + 1);
-        const results = asArray(searchPayload.results);
-        const warnings = asArray(searchPayload.warnings);
-        const meta = searchPayload.meta || {};
-
-        stats.batchesProcessed += 1;
-        stats.warnings.push(...warnings);
-
-        if (warnings.length) {
-            log.warning(`Batch ${page} returned warnings`, { warnings });
-        }
-
-        if (!results.length) {
-            stats.emptyBatches += 1;
-            consecutiveEmptyBatches += 1;
-            log.info(`Batch ${page}: no jobs returned`, { offset, consecutiveEmptyBatches });
-            if (consecutiveEmptyBatches >= CONFIG.MAX_EMPTY_BATCHES) break;
-            offset += 1;
-            await sleep(CONFIG.REQUEST_DELAY_MS);
-            page += 1;
-            continue;
-        }
-
-        const pageRecords = [];
-        let pageDuplicates = 0;
-        let pageMissingSalary = 0;
-        let pageMissingBenefits = 0;
-        let pageMissingCompanyLogo = 0;
-
-        for (const result of results) {
-            const dedupeKey = buildDedupeKey(result);
-            if (!dedupeKey || seenJobKeys.has(dedupeKey)) {
-                pageDuplicates += 1;
-                continue;
-            }
-
-            seenJobKeys.add(dedupeKey);
-
-            const minAnnual = Number.isFinite(result.salary?.min_annual) ? result.salary.min_annual : null;
-            const maxAnnual = Number.isFinite(result.salary?.max_annual) ? result.salary.max_annual : null;
-
-            if (minAnnual === null && maxAnnual === null) pageMissingSalary += 1;
-            if (!hasValue(result.benefits)) pageMissingBenefits += 1;
-            if (!hasValue(result.company_logo)) pageMissingCompanyLogo += 1;
-
-            pageRecords.push(normalizeJobRecord(result, {
-                searchQuery: effectiveSearch.searchQuery || '',
-                searchLocation: effectiveSearch.location || '',
-                page,
-                offset,
-            }));
-        }
-
-        stats.duplicatesSkipped += pageDuplicates;
-        stats.missingSalary += pageMissingSalary;
-        stats.missingBenefits += pageMissingBenefits;
-        stats.missingCompanyLogo += pageMissingCompanyLogo;
-
-        if (!pageRecords.length) {
-            stats.emptyBatches += 1;
-            consecutiveEmptyBatches += 1;
-            log.info(`Batch ${page}: duplicate-only batch`, {
-                offset,
-                duplicatesSkipped: pageDuplicates,
-                consecutiveEmptyBatches,
-            });
-            if (consecutiveEmptyBatches >= CONFIG.MAX_EMPTY_BATCHES) break;
-            offset += 1;
-            await sleep(CONFIG.REQUEST_DELAY_MS);
-            page += 1;
-            continue;
-        }
-
-        consecutiveEmptyBatches = 0;
-
-        const limitedRecords = Number.isFinite(remainingSlots)
-            ? pageRecords.slice(0, remainingSlots)
-            : pageRecords;
-
-        const pushedCount = await pushRecordsSafely(limitedRecords);
-        stats.recordsPushed += pushedCount;
-
-        log.info(`Batch ${page}: pushed ${pushedCount} jobs`, {
-            offset,
-            total: stats.recordsPushed,
-            duplicatesSkipped: pageDuplicates,
-            missingSalary: pageMissingSalary,
-            missingBenefits: pageMissingBenefits,
-            missingCompanyLogo: pageMissingCompanyLogo,
-            reportedTotal: meta.total || null,
-        });
-
-        if (results.length < CONFIG.MCP_PAGE_SIZE) break;
-
-        offset += pageDuplicates > 0 ? 1 : Math.max(results.length, CONFIG.MCP_PAGE_SIZE);
-        await sleep(CONFIG.REQUEST_DELAY_MS);
-        page += 1;
-    }
+    await runBrowserSession(proxyInput, effectiveSearch, targetJobs, maxPages);
 
     const durationSeconds = Math.round((Date.now() - stats.startTime) / 1000);
-
     await Actor.setValue('statistics', {
-        endpoint: CONFIG.MCP_ENDPOINT,
-        tool: 'search_jobs',
+        provider: 'ziprecruiter_camoufox_json',
         jobs: stats.recordsPushed,
-        batchesProcessed: stats.batchesProcessed,
+        pagesProcessed: stats.pagesProcessed,
         duplicatesSkipped: stats.duplicatesSkipped,
         missingSalary: stats.missingSalary,
         missingBenefits: stats.missingBenefits,
         missingCompanyLogo: stats.missingCompanyLogo,
-        emptyBatches: stats.emptyBatches,
         warnings: stats.warnings,
         durationSeconds,
         finishedAt: new Date().toISOString(),
     });
-
     log.info('Run finished', {
         jobs: stats.recordsPushed,
-        batchesProcessed: stats.batchesProcessed,
+        pagesProcessed: stats.pagesProcessed,
         duplicatesSkipped: stats.duplicatesSkipped,
-        missingSalary: stats.missingSalary,
-        missingBenefits: stats.missingBenefits,
-        missingCompanyLogo: stats.missingCompanyLogo,
-        emptyBatches: stats.emptyBatches,
         durationSeconds,
     });
 } catch (error) {
