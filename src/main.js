@@ -1,19 +1,20 @@
+import { readFile } from 'node:fs/promises';
+
 import { Actor, log } from 'apify';
-import { launchOptions as camoufoxLaunchOptions } from 'camoufox-js';
-import { firefox } from 'playwright';
 
 import {
     adaptWebCard,
     asArray,
     buildJobIdentity,
-    extractEmbeddedJson,
-    extractNextFlightData,
+    detectBlockedPage,
     hasValue,
-    normalizeInputString,
     normalizeJobRecord,
+    parseSearchHtml,
     resolveEffectiveSearch,
+    responseSnapshot,
     sanitizeRecordForDataset,
 } from './actor-utils.js';
+import { createHttpTransport } from './http-client.js';
 
 await Actor.init();
 
@@ -21,18 +22,30 @@ const CONFIG = {
     DEFAULT_MAX_JOBS: 20,
     DEFAULT_MAX_PAGES: 10,
     MAX_PAGES_HARD_LIMIT: 200,
-    NAVIGATION_TIMEOUT_MS: 45000,
-    JSON_WAIT_MS: 15000,
-    REQUEST_DELAY_MS: 250,
+    PROXY_ROUNDS: 5,
+    HTTP_TIMEOUT_MS: 45000,
+    RETRY_BASE_DELAY_MS: 1000,
+    RETRY_MAX_DELAY_MS: 8000,
+    RATE_LIMIT_MAX_DELAY_MS: 30000,
+    SESSION_SWITCH_DELAY_MS: 500,
+    RESOURCE_TIME_BUDGET_MS: 180000,
+    PAGE_DELAY_MS: 300,
+    PAGE_DELAY_JITTER_MS: 500,
 };
 
 const stats = {
     pagesProcessed: 0,
     recordsPushed: 0,
     duplicatesSkipped: 0,
+    itemErrors: 0,
+    blockedResponses: 0,
+    transportErrors: 0,
     missingSalary: 0,
     missingBenefits: 0,
     missingCompanyLogo: 0,
+    transportCounts: {},
+    stopReason: '',
+    totalListings: null,
     warnings: [],
     startTime: Date.now(),
 };
@@ -43,241 +56,224 @@ function sleep(ms) {
     });
 }
 
-function configuredProxyGroups(proxyInput) {
-    return proxyInput?.groups || proxyInput?.apifyProxyGroups || [];
+function jitterDelay(baseMs, spreadMs) {
+    return baseMs + Math.floor(Math.random() * spreadMs);
 }
 
-function proxyInputForAttempt(proxyInput, attempt) {
-    if (attempt === 1 || !proxyInput || Array.isArray(proxyInput.proxyUrls)) return proxyInput;
-    const groups = configuredProxyGroups(proxyInput).map((group) => String(group).toUpperCase());
-    if (!groups.includes('UNBLOCKER')) return proxyInput;
+function retryDelay(round) {
+    const base = Math.min(CONFIG.RETRY_BASE_DELAY_MS * 2 ** round, CONFIG.RETRY_MAX_DELAY_MS);
+    return jitterDelay(base, 600);
+}
 
-    const residentialInput = { ...proxyInput, apifyProxyGroups: ['RESIDENTIAL'] };
-    delete residentialInput.groups;
-    return residentialInput;
+function sessionSwitchDelay() {
+    return jitterDelay(CONFIG.SESSION_SWITCH_DELAY_MS, 400);
+}
+
+function configuredProxyGroups(proxyInput) {
+    return proxyInput?.groups || proxyInput?.apifyProxyGroups || [];
 }
 
 function proxyInputForSearch(proxyInput, effectiveSearch) {
     const location = effectiveSearch.location.toLowerCase();
     const isUsSearch = /united states|\busa\b|\bunited states of america\b/.test(location);
     const hasCountry = proxyInput?.apifyProxyCountry || proxyInput?.countryCode;
-    const usesApifyProxy = proxyInput?.useApifyProxy === true || configuredProxyGroups(proxyInput).length > 0;
+    const groups = configuredProxyGroups(proxyInput).map((group) => String(group).toUpperCase());
+    const usesApifyProxy = proxyInput?.useApifyProxy === true || groups.length > 0;
+    // Unblocker selects the country automatically; forcing one shrinks its pool.
+    if (usesApifyProxy && groups.includes('UNBLOCKER')) return proxyInput;
     if (!isUsSearch || hasCountry || !usesApifyProxy) return proxyInput;
     return { ...proxyInput, apifyProxyCountry: 'US' };
 }
 
-async function createBrowserProxyUrl(proxyInput, attempt = 1) {
+async function buildProxyConfiguration(proxyInput) {
     const isCloudRun = Actor.isAtHome();
     const groups = configuredProxyGroups(proxyInput);
     const requestedApifyProxy = proxyInput?.useApifyProxy === true || groups.length > 0;
     const hasCustomProxyUrls = Array.isArray(proxyInput?.proxyUrls) && proxyInput.proxyUrls.length > 0;
 
-    if ((!isCloudRun && requestedApifyProxy && !hasCustomProxyUrls) || (!requestedApifyProxy && !hasCustomProxyUrls)) {
-        if (requestedApifyProxy && !isCloudRun) {
-            log.warning(
-                'Apify Proxy was requested outside Apify; running without it. Use an Apify run or provide custom proxy URLs.',
-            );
-        }
+    if (!requestedApifyProxy && !hasCustomProxyUrls) return undefined;
+    if (!isCloudRun && !hasCustomProxyUrls) {
+        log.warning(
+            'Apify Proxy was requested outside Apify; running without it. Use an Apify run or provide custom proxy URLs.',
+        );
         return undefined;
     }
 
-    const proxyConfiguration = await Actor.createProxyConfiguration(proxyInput);
-    if (!proxyConfiguration) return undefined;
-
-    const usesUnblocker = groups.some((group) => String(group).toUpperCase() === 'UNBLOCKER');
-    const sessionId = usesUnblocker ? undefined : `ziprecruiter_${Date.now()}_${attempt}`;
-    const proxyUrl = await proxyConfiguration.newUrl(sessionId);
-    let proxyType = 'configured proxy';
-    if (usesUnblocker) proxyType = 'Unblocker';
-    else if (groups.some((group) => String(group).toUpperCase() === 'RESIDENTIAL')) proxyType = 'Residential';
-    log.info(`Using Apify ${proxyType} for the browser context.`);
-    return proxyUrl;
+    return Actor.createProxyConfiguration(proxyInput);
 }
 
-function webPageUrl(effectiveSearch, page) {
-    if (effectiveSearch.searchUrl) {
-        const url = new URL(effectiveSearch.searchUrl);
-        if (page > 1) url.searchParams.set('page', String(page));
+function buildPageUrl(search, page) {
+    if (search.mode === 'url') {
+        const url = new URL(search.searchUrl);
+        if (page > 1 || url.searchParams.has('page')) url.searchParams.set('page', String(page));
+        if (url.searchParams.has('days_ago') && !url.searchParams.has('days')) {
+            url.searchParams.set('days', url.searchParams.get('days_ago'));
+            url.searchParams.delete('days_ago');
+        }
+        if (/^\d+$/.test(String(search.daysBack)) && !url.searchParams.has('days')) {
+            url.searchParams.set('days', String(search.daysBack));
+        }
         return url.toString();
     }
 
     const params = new URLSearchParams();
-    if (effectiveSearch.searchQuery) params.set('search', effectiveSearch.searchQuery);
-    if (effectiveSearch.location) params.set('location', effectiveSearch.location);
-    if (/^\d+$/.test(String(effectiveSearch.daysBack))) params.set('days_ago', String(effectiveSearch.daysBack));
+    if (search.searchQuery) params.set('search', search.searchQuery);
+    if (search.location) params.set('location', search.location);
+    if (/^\d+$/.test(String(search.daysBack))) params.set('days', String(search.daysBack));
     if (page > 1) params.set('page', String(page));
     return `https://www.ziprecruiter.com/jobs-search?${params.toString()}`;
 }
 
-async function readPageScripts(page) {
-    const deadline = Date.now() + CONFIG.JSON_WAIT_MS;
-    let latestScripts = [];
-    while (Date.now() < deadline) {
-        try {
-            latestScripts = await page.evaluate(() =>
-                [...document.scripts].map((script) => script.textContent?.trim() || '').filter(Boolean),
-            );
-            if (
-                latestScripts.some(
-                    (text) => text.includes('hydrateJobCardsResponse') || text.includes('serializedJobCardsData'),
-                )
-            )
-                return latestScripts;
-        } catch (error) {
-            if (!/execution context was destroyed|navigation/i.test(error.message)) throw error;
-        }
-        await page.waitForTimeout(500);
-    }
-    return latestScripts;
-}
-
-async function readDomJobCards(page) {
-    return page.evaluate(() => {
-        const jsonLdItems = [...document.querySelectorAll('script[type="application/ld+json"]')].flatMap((script) => {
-            try {
-                const value = JSON.parse(script.textContent || '{}');
-                return value?.['@type'] === 'ItemList' ? value.itemListElement || [] : [];
-            } catch {
-                return [];
-            }
-        });
-        const urlsByTitle = new Map(jsonLdItems.map((item) => [item.name, item.url]));
-        const seen = new Set();
-
-        return [...document.querySelectorAll('article[id^="job-card-"]')]
-            .map((article) => {
-                const listingKey = article.id.slice('job-card-'.length);
-                if (!listingKey || seen.has(listingKey)) return null;
-                seen.add(listingKey);
-
-                const title = article.querySelector('[data-testid="serp-job-card-title"]')?.textContent?.trim() || '';
-                const company = article.querySelector('[data-testid="job-card-company"]')?.textContent?.trim() || '';
-                const location = article.querySelector('[data-testid="job-card-location"]')?.textContent?.trim() || '';
-                const locationTypes = [...article.innerText.matchAll(/(?:·|•)\s*(Remote|Hybrid|On-site)/gi)].map(
-                    (match) => match[1],
-                );
-                const logoUrl = article.querySelector('img')?.src || '';
-                const jobUrl = urlsByTitle.get(title) || `https://www.ziprecruiter.com/jobs//j?lvk=${listingKey}`;
-
-                return {
-                    listingKey,
-                    title,
-                    company: { name: company },
-                    location: { displayName: location },
-                    locationTypes,
-                    isRemote: locationTypes.some((value) => /remote/i.test(value)),
-                    companyLogo: { logoUrl },
-                    rawCanonicalZipJobPageUrl: jobUrl,
-                };
-            })
-            .filter(Boolean);
-    });
-}
-
-function parsePagePayload(scriptTexts) {
+function sanitizeUrl(value) {
     try {
-        return extractEmbeddedJson(scriptTexts);
+        const url = new URL(value);
+        return `${url.origin}${url.pathname}`;
     } catch {
-        try {
-            return extractNextFlightData(scriptTexts);
-        } catch {
-            return null;
-        }
+        return 'invalid-url';
     }
 }
 
-async function readPageData(page, url) {
-    let response;
-    try {
-        response = await page.goto(url, {
-            waitUntil: 'commit',
-            timeout: CONFIG.NAVIGATION_TIMEOUT_MS,
-        });
-    } catch (error) {
-        throw new Error(`ZipRecruiter navigation did not complete: ${error.message}`);
-    }
-
-    const status = response?.status() || 0;
-    await page.waitForLoadState('domcontentloaded', { timeout: CONFIG.NAVIGATION_TIMEOUT_MS }).catch(() => undefined);
-    const scriptTexts = await readPageScripts(page);
-    const data = parsePagePayload(scriptTexts);
-    if (data) {
-        if (status >= 400) {
-            log.warning(`ZipRecruiter returned HTTP ${status} with a usable job payload; continuing.`);
-        }
-        return { data, status };
-    }
-
-    const domCards = await readDomJobCards(page).catch(() => []);
-    if (domCards.length) {
-        log.warning('ZipRecruiter did not expose a structured payload; using rendered job cards as a fallback.');
-        return {
-            data: {
-                hydrateJobCardsResponse: { jobCards: domCards },
-                page: Number(new URL(url).searchParams.get('page')) || 1,
-                maxPages: Number(new URL(url).searchParams.get('page')) || 1,
-            },
-            status,
-        };
-    }
-
-    const title = await page.title().catch(() => '');
-    const blocked = /captcha|access denied|just a moment|challenge|robot/i.test(`${title} ${scriptTexts.join(' ')}`);
-    if (blocked || status >= 400) {
-        throw new Error(
-            `ZipRecruiter page was blocked or incomplete (HTTP ${status || 'unknown'}, title: ${title || 'unknown'}).`,
-        );
-    }
-    throw new Error('ZipRecruiter page did not contain a supported job payload.');
+function extractTitle(html) {
+    return (
+        String(html || '')
+            .match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]
+            ?.trim() || ''
+    );
 }
 
-async function runBrowserSession(proxyInput, effectiveSearch, targetJobs, maxPages) {
-    const maxAttempts = 2;
+let discoveryDocPromise;
 
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-        const attemptProxyInput = proxyInputForAttempt(proxyInput, attempt);
-        if (attempt > 1 && attemptProxyInput !== proxyInput) {
-            log.warning('Retrying ZipRecruiter with a fresh Residential proxy route.');
-        }
-        const proxyUrl = await createBrowserProxyUrl(attemptProxyInput, attempt);
-        const browser = await firefox.launch(
-            await camoufoxLaunchOptions({
-                headless: true,
-                ...(proxyUrl ? { proxy: proxyUrl } : {}),
-                humanize: true,
-                block_webrtc: true,
-                enable_cache: true,
-            }),
+function loadDiscoveryDoc() {
+    discoveryDocPromise ||= readFile(new URL('../API_DISCOVERY.md', import.meta.url), 'utf8').catch(() => '');
+    return discoveryDocPromise;
+}
+
+function extractDiscoveryGuidance(doc) {
+    if (!doc) return '';
+    const blocks = [];
+    for (const heading of ['## Failure diagnostics', '## Validation requirements', '## Selected flow']) {
+        const start = doc.indexOf(heading);
+        if (start < 0) continue;
+        const end = doc.indexOf('\n## ', start + heading.length);
+        blocks.push(doc.slice(start, end < 0 ? doc.length : end).trim());
+    }
+    return blocks.join('\n\n');
+}
+
+async function diagnoseFailure(url, error, snapshot) {
+    const doc = await loadDiscoveryDoc();
+    log.warning('ZipRecruiter request failed. Reading API_DISCOVERY.md before diagnosing.');
+    if (snapshot) {
+        log.warning(
+            `Last response: HTTP ${snapshot.status}, ${snapshot.bodyLength} bytes, profile ${snapshot.profile}, blocked=${snapshot.blocked}, markers=${JSON.stringify(snapshot.markers)}.`,
         );
-        const context = await browser.newContext();
-        const page = await context.newPage();
+    }
+    log.warning(`Failure target: ${sanitizeUrl(url)}. Error: ${error?.message || 'unknown error'}.`);
+    const guidance = extractDiscoveryGuidance(doc);
+    if (guidance) log.warning(`API_DISCOVERY.md guidance:\n${guidance}`);
+    else log.warning('API_DISCOVERY.md is missing or has no diagnostic guidance.');
+}
 
-        await page.route('**/*', async (route) => {
-            const resourceType = route.request().resourceType();
-            const requestUrl = route.request().url();
-            if (
-                resourceType === 'media' ||
-                /google-analytics|googletagmanager|doubleclick|facebook\.net/i.test(requestUrl)
-            ) {
-                await route.abort();
-                return;
+async function loadResource(transport, url, parseFn, label, { proxyRounds = CONFIG.PROXY_ROUNDS } = {}) {
+    let lastError;
+    let lastSnapshot;
+    let primaryProxyRetryUsed = false;
+    let timeBudgetExceeded = false;
+    const startedAt = Date.now();
+
+    // The profile that last succeeded stays first. If it is challenged or gets
+    // an unusable page, rotate the proxy once before demoting it so the known
+    // working browser gets a fresh exit IP instead of a long profile tour.
+    const canRotateForPrimary = (profile, round) => {
+        if (primaryProxyRetryUsed || profile !== transport.profiles[0]) return false;
+        if (!transport.hasProxy || round >= proxyRounds) return false;
+        primaryProxyRetryUsed = true;
+        return true;
+    };
+
+    for (let round = 0; round <= proxyRounds; round += 1) {
+        for (const profile of transport.profiles) {
+            if (Date.now() - startedAt >= CONFIG.RESOURCE_TIME_BUDGET_MS) {
+                timeBudgetExceeded = true;
+                break;
             }
-            await route.continue();
-        });
 
-        try {
-            await scrapePages(page, effectiveSearch, targetJobs, maxPages);
-            return;
-        } catch (error) {
-            const canRetry = attempt < maxAttempts && stats.recordsPushed === 0;
-            if (!canRetry) throw error;
-            log.warning(`Browser/proxy attempt ${attempt} failed: ${error.message}. Retrying with a fresh route.`);
-        } finally {
-            await page.close().catch(() => undefined);
-            await context.close().catch(() => undefined);
-            await browser.close().catch(() => undefined);
+            let result;
+            try {
+                result = await transport.fetchOnce(url, profile);
+            } catch (error) {
+                lastError = error;
+                stats.transportErrors += 1;
+                log.debug(`${label}: ${profile} network error (${error.message}).`);
+                if (canRotateForPrimary(profile, round)) break;
+                transport.markFailure(profile);
+                await sleep(sessionSwitchDelay());
+                continue;
+            }
+
+            stats.transportCounts[profile] = (stats.transportCounts[profile] || 0) + 1;
+            const title = extractTitle(result.html);
+            const snapshot = responseSnapshot({
+                url: sanitizeUrl(url),
+                status: result.status,
+                title,
+                body: result.html,
+                transport: 'impit',
+                profile,
+            });
+            lastSnapshot = snapshot;
+
+            if (result.status === 429) {
+                const waitMs = Math.min(result.retryAfterMs ?? retryDelay(round), CONFIG.RATE_LIMIT_MAX_DELAY_MS);
+                log.debug(`${label}: HTTP 429, waiting ${Math.round(waitMs / 1000)}s.`);
+                await sleep(waitMs);
+                continue;
+            }
+            if (result.status >= 500) {
+                lastError = new Error(`${label} returned HTTP ${result.status}`);
+                log.debug(`${label}: ${profile} returned HTTP ${result.status}.`);
+                await sleep(retryDelay(round));
+                continue;
+            }
+            if (detectBlockedPage({ status: result.status, title, body: result.html })) {
+                lastError = new Error(`${label} was blocked with HTTP ${result.status}`);
+                stats.blockedResponses += 1;
+                log.debug(`${label}: ${profile} was challenged (HTTP ${result.status}).`);
+                if (canRotateForPrimary(profile, round)) break;
+                transport.markFailure(profile);
+                await sleep(sessionSwitchDelay());
+                continue;
+            }
+            if (result.status >= 400) {
+                lastError = new Error(`${label} returned HTTP ${result.status}`);
+                log.warning(`${label} failed with HTTP ${result.status}.`);
+                await diagnoseFailure(url, lastError, snapshot);
+                throw lastError;
+            }
+
+            const data = parseFn(result.html);
+            if (!data) {
+                lastError = new Error(`${label} response did not contain the expected job payload`);
+                log.debug(
+                    `${label}: ${profile} returned HTTP ${result.status} without a payload (title="${snapshot.title}", markers=${JSON.stringify(snapshot.markers)}).`,
+                );
+                if (canRotateForPrimary(profile, round)) break;
+                await sleep(sessionSwitchDelay());
+                continue;
+            }
+
+            transport.markSuccess(profile);
+            return { ...result, data, snapshot };
         }
+
+        if (timeBudgetExceeded || round >= proxyRounds) break;
+        const rotated = await transport.rotateProxy();
+        if (!rotated) break;
+        await sleep(sessionSwitchDelay());
     }
+
+    await diagnoseFailure(url, lastError, lastSnapshot);
+    throw lastError || new Error(`${label} failed without a recorded error`);
 }
 
 async function pushRecords(records) {
@@ -287,68 +283,123 @@ async function pushRecords(records) {
     return cleanRecords.length;
 }
 
-async function scrapePages(page, effectiveSearch, targetJobs, maxPages) {
+async function scrapePages(transport, search, targetJobs, maxPages) {
     const seenJobKeys = new Set();
-    let currentPage = 1;
+    let currentPage = search.startPage || 1;
+    let pagesRequested = 0;
+    let emptyPages = 0;
+    stats.stopReason = 'max_pages';
 
-    while (currentPage <= maxPages && (!Number.isFinite(targetJobs) || stats.recordsPushed < targetJobs)) {
-        const url = webPageUrl(effectiveSearch, currentPage);
-        log.info(`Opening ZipRecruiter result page ${currentPage}/${maxPages}.`);
-        const { data } = await readPageData(page, url);
+    while (pagesRequested < maxPages && (!Number.isFinite(targetJobs) || stats.recordsPushed < targetJobs)) {
+        const url = buildPageUrl(search, currentPage);
+        let result;
+        try {
+            result = await loadResource(transport, url, parseSearchHtml, `result page ${currentPage}`);
+        } catch (error) {
+            if (stats.recordsPushed > 0) {
+                log.warning(`Stopping after partial success so saved jobs are kept: ${error.message}`);
+                stats.stopReason = 'partial_failure';
+                break;
+            }
+            throw error;
+        }
+        const { data } = result;
         const cards = asArray(data.hydrateJobCardsResponse?.jobCards);
-        const details = data.getJobDetailsResponse?.jobDetails || null;
         stats.pagesProcessed += 1;
+        pagesRequested += 1;
 
         if (!cards.length) {
-            log.info(`Result page ${currentPage} returned no job cards.`);
+            log.info(`Result page ${currentPage} returned no job cards. Stopping.`);
+            stats.stopReason = 'no_cards';
             break;
         }
 
+        const pageTotal = Number(data.totalListings);
+        if (Number.isFinite(pageTotal) && pageTotal > 0) stats.totalListings = pageTotal;
+        const details = data.getJobDetailsResponse?.jobDetails || null;
         const records = [];
-        for (const [index, card] of cards.entries()) {
-            const adapted = adaptWebCard(card, index === 0 ? details : null);
-            if (!hasValue(adapted.title) && !hasValue(adapted.job_redirect_url) && !hasValue(adapted.listing_key))
-                continue;
-            const identity = buildJobIdentity(adapted);
-            if (!identity || seenJobKeys.has(identity)) {
-                stats.duplicatesSkipped += 1;
-                continue;
-            }
-            seenJobKeys.add(identity);
 
-            if (!hasValue(adapted.salary?.min) && !hasValue(adapted.salary?.max)) stats.missingSalary += 1;
-            if (!hasValue(adapted.benefits)) stats.missingBenefits += 1;
-            if (!hasValue(adapted.company_logo)) stats.missingCompanyLogo += 1;
-            records.push(
-                normalizeJobRecord(adapted, {
-                    searchQuery: effectiveSearch.searchQuery,
-                    searchLocation: effectiveSearch.location,
-                    page: currentPage,
-                    offset: currentPage === 1 ? 0 : null,
-                }),
-            );
+        for (const [index, card] of cards.entries()) {
+            try {
+                let cardDetails = null;
+                if (details) {
+                    const detailKey = String(details.listingKey || '');
+                    if (detailKey) {
+                        if (detailKey === String(card.listingKey)) cardDetails = details;
+                    } else if (index === 0) {
+                        cardDetails = details;
+                    }
+                }
+                const adapted = adaptWebCard(card, cardDetails);
+                if (!hasValue(adapted.title) && !hasValue(adapted.job_redirect_url) && !hasValue(adapted.listing_key))
+                    continue;
+                const identity = buildJobIdentity(adapted);
+                if (!identity || seenJobKeys.has(identity)) {
+                    stats.duplicatesSkipped += 1;
+                    continue;
+                }
+                seenJobKeys.add(identity);
+
+                if (!hasValue(adapted.salary?.min) && !hasValue(adapted.salary?.max)) stats.missingSalary += 1;
+                if (!hasValue(adapted.benefits)) stats.missingBenefits += 1;
+                if (!hasValue(adapted.company_logo)) stats.missingCompanyLogo += 1;
+
+                records.push(
+                    normalizeJobRecord(adapted, {
+                        searchQuery: search.searchQuery,
+                        searchLocation: search.location,
+                        page: currentPage,
+                        offset: currentPage === 1 ? 0 : null,
+                    }),
+                );
+            } catch (error) {
+                stats.itemErrors += 1;
+                log.warning(`Skipped a malformed job card on page ${currentPage}: ${error.message}`);
+            }
         }
 
         const remaining = Number.isFinite(targetJobs) ? targetJobs - stats.recordsPushed : Number.POSITIVE_INFINITY;
-        const pushed = await pushRecords(records.slice(0, Math.max(remaining, 0)));
+        const selectedRecords = records.slice(0, Math.max(remaining, 0));
+        const pushed = await pushRecords(selectedRecords);
         stats.recordsPushed += pushed;
         log.info(
             `Page ${currentPage}: saved ${pushed} jobs; total ${stats.recordsPushed}${Number.isFinite(targetJobs) ? `/${targetJobs}` : ''}.`,
         );
 
+        if (Number.isFinite(targetJobs) && stats.recordsPushed >= targetJobs) {
+            stats.stopReason = 'target_reached';
+            break;
+        }
+
+        if (pushed === 0) {
+            emptyPages += 1;
+            if (emptyPages >= 2) {
+                stats.stopReason = 'duplicate_exhausted';
+                break;
+            }
+        } else {
+            emptyPages = 0;
+        }
+
         const reportedPage = Number(data.page) || currentPage;
-        const reportedMaxPages = Number(data.maxPages) || maxPages;
-        if (reportedPage >= reportedMaxPages || cards.length === 0) break;
+        const reportedMaxPages = Number(data.maxPages);
+        if (Number.isFinite(reportedMaxPages) && reportedPage >= reportedMaxPages) {
+            stats.stopReason = 'source_exhausted';
+            break;
+        }
+
         currentPage += 1;
-        await sleep(CONFIG.REQUEST_DELAY_MS);
+        await sleep(jitterDelay(CONFIG.PAGE_DELAY_MS, CONFIG.PAGE_DELAY_JITTER_MS));
     }
 }
+
+let transport;
 
 try {
     const input = (await Actor.getInput()) || {};
     const effectiveSearch = resolveEffectiveSearch(input);
-    if (!effectiveSearch.searchUrl && !effectiveSearch.searchQuery && !effectiveSearch.location) {
-        throw new Error('Missing search input. Provide searchUrl, searchQuery, or location.');
+    if (effectiveSearch.mode === 'none') {
+        throw new Error('Missing search input. Provide searchQuery, location, or searchUrl.');
     }
 
     const maxJobsInput = Number(input.maxJobs ?? CONFIG.DEFAULT_MAX_JOBS);
@@ -357,38 +408,49 @@ try {
         Math.max(Number(input.maxPages) || CONFIG.DEFAULT_MAX_PAGES, 1),
         CONFIG.MAX_PAGES_HARD_LIMIT,
     );
-    const scrapeMode = normalizeInputString(input.scrapeMode) || 'listing_only';
     const configuredProxyInput = input.proxyConfiguration ?? {
         useApifyProxy: true,
-        apifyProxyGroups: ['UNBLOCKER'],
+        apifyProxyGroups: ['RESIDENTIAL'],
+        apifyProxyCountry: 'US',
     };
     const proxyInput = proxyInputForSearch(configuredProxyInput, effectiveSearch);
+    const proxyConfiguration = await buildProxyConfiguration(proxyInput);
 
-    log.info('Starting ZipRecruiter Camoufox browser run', {
+    log.info('Starting ZipRecruiter run', {
+        mode: effectiveSearch.mode,
         searchQuery: effectiveSearch.searchQuery || null,
         location: effectiveSearch.location || null,
         usingSearchUrl: Boolean(effectiveSearch.searchUrl),
         maxJobs: Number.isFinite(targetJobs) ? targetJobs : 0,
         maxPages,
-        scrapeMode,
+        usingProxy: Boolean(proxyConfiguration),
     });
-    if (scrapeMode === 'listing_with_details') {
-        log.warning(
-            'listing_with_details is retained for compatibility; the actor captures descriptions when available in the listing payload.',
-        );
-    }
 
-    await runBrowserSession(proxyInput, effectiveSearch, targetJobs, maxPages);
+    transport = createHttpTransport({
+        proxyConfiguration,
+        proxyInput,
+        log,
+        timeoutMs: CONFIG.HTTP_TIMEOUT_MS,
+    });
+
+    await scrapePages(transport, effectiveSearch, targetJobs, maxPages);
 
     const durationSeconds = Math.round((Date.now() - stats.startTime) / 1000);
     await Actor.setValue('statistics', {
-        provider: 'ziprecruiter_camoufox_json',
+        provider: 'ziprecruiter_json',
         jobs: stats.recordsPushed,
         pagesProcessed: stats.pagesProcessed,
         duplicatesSkipped: stats.duplicatesSkipped,
+        itemErrors: stats.itemErrors,
+        blockedResponses: stats.blockedResponses,
+        transportErrors: stats.transportErrors,
         missingSalary: stats.missingSalary,
         missingBenefits: stats.missingBenefits,
         missingCompanyLogo: stats.missingCompanyLogo,
+        transportCounts: stats.transportCounts,
+        proxyRotations: transport?.proxyRotations ?? 0,
+        totalListings: stats.totalListings,
+        stopReason: stats.stopReason,
         warnings: stats.warnings,
         durationSeconds,
         finishedAt: new Date().toISOString(),
@@ -397,11 +459,14 @@ try {
         jobs: stats.recordsPushed,
         pagesProcessed: stats.pagesProcessed,
         duplicatesSkipped: stats.duplicatesSkipped,
+        stopReason: stats.stopReason,
         durationSeconds,
     });
 } catch (error) {
     log.exception(error, 'Actor failed');
     throw error;
+} finally {
+    transport?.dispose();
 }
 
 await Actor.exit();

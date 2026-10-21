@@ -1,81 +1,176 @@
-# ZipRecruiter Access Discovery
+# ZipRecruiter API discovery
 
-## Current decision
+Last verified: 2026-10-21. Evidence was collected live from a residential PK connection and from Apify cloud runs. ZipRecruiter changes its payload shape without notice, so this document describes the markers to look for, not a single immutable schema.
 
-The actor no longer uses the MCP endpoint, direct HTTP API calls, or third-party aggregators. The selected path is one Camoufox Firefox browser context opened through Apify Unblocker, with a Residential retry route when the first route fails, and the same context reused while pagination is processed. The page is opened normally and the actor reads the current Next.js flight payload (`serializedJobCardsData.jobKeysMap`) before falling back to the older embedded JSON bootstrap and rendered job cards.
+## Selected flow
 
-This choice follows the current evidence:
+- Endpoint: `https://www.ziprecruiter.com/jobs-search`
+- Method: `GET`
+- Authentication: none
+- Required request header: `accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8`
+- Request language: `accept-language: en-US,en;q=0.9`
+- Transport: `impit` with a documented Firefox browser profile
+- Pagination: `page` query parameter, 1-based, 20 cards per page
+- Description data: `shortDescription` from the listing payload. The actor stays listing-only and does not request job detail pages.
 
-- The MCP endpoint repeatedly returned HTTP 429 during local reproduction.
-- The mobile jobs endpoint returned HTTP 403 `forbidden cf-waf` from the discovery environment.
-- Direct ZipRecruiter search-page requests returned Cloudflare HTTP 403 challenge pages.
-- A live ZipRecruiter search page currently returns a Next.js flight payload with `serializedJobCardsData.jobKeysMap`, `jobKeys`, `totalListings`, and `pageNumber`; the records contain the listing fields required by the actor.
-- The same live page also exposes an `ItemList` JSON-LD block and rendered job cards, providing evidence-backed fallbacks when the flight payload is unavailable.
-- The maintained `jobspy-js` implementation remains the reference for the older `hydrateJobCardsResponse.jobCards` bootstrap shape.
-- A Camoufox browser context plus a managed Unblocker route gives the target a real page navigation flow and preserves cookies/runtime state for subsequent pages. A failed first route is retried in a fresh context with Residential.
+The request `accept` header is not cosmetic. A live test with impit's default `*/*` accept value returned HTTP 403 with the Cloudflare challenge page. Supplying the navigation accept header on the same profile returned HTTP 200 with the full job payload.
 
-The browser route is not described as a guaranteed anti-bot bypass. A successful production run must be verified on Apify with the selected proxy route.
+## Request examples
 
-## Selected page flow
+Keyword and location search:
 
-- Keyword mode: `https://www.ziprecruiter.com/jobs-search?search=...&location=...` (page 1 and later pages; later pages add `page=N`)
-- URL mode page 1: the caller's `searchUrl` exactly, with search fields ignored
-- URL mode later pages: the supplied URL with `page=N`
-- Browser: Camoufox Firefox, headless mode
-- Proxy: Apify `UNBLOCKER` by default, with no session ID passed
-- Context lifecycle: one proxy URL and one browser context for the run
-- Speed controls: response commit, targeted JSON polling, and abort media/analytics resources without blocking images or fonts
-- Extraction markers, in order: `serializedJobCardsData.jobKeysMap`, `hydrateJobCardsResponse.jobCards`, then rendered `article[id^="job-card-"]` cards with `ItemList` JSON-LD URLs
-- Pagination marker: `pageNumber` and `totalListings` from the Next.js payload, or embedded `page` and `maxPages` from the older bootstrap
-- Stable identity: `listingKey`, then canonical job URL, then conservative listing fields
+```text
+https://www.ziprecruiter.com/jobs-search?search=software%20engineer&location=New%20York%2C%20NY&page=2
+```
 
-## Fields confirmed by public implementation evidence
+Search URL input:
 
-The maintained `jobspy-js` ZipRecruiter source reads these payload paths or equivalent values:
+```text
+https://www.ziprecruiter.com/jobs-search?search=data%20analyst&location=Chicago%2C%20IL&page=3
+```
 
-- `hydrateJobCardsResponse.jobCards`
-- `getJobDetailsResponse.jobDetails`
-- `listingKey`
-- `title`
-- `company.name`
-- `location.city`, `location.stateCode`, `location.countryCode`
-- `employmentTypes`
-- `status.postedAtUtc`
-- `pay.interval`, `pay.min`, `pay.max`
-- `shortDescription`
-- `applyButtonConfig.externalApplyUrl`
-- `rawCanonicalZipJobPageUrl`
+Posting-age filter:
 
-The actor maps these into its existing public record names and adds `source`, `provider`, stable listing key, description, posting date, and compensation interval fields. Arrays remain arrays.
+```text
+https://www.ziprecruiter.com/jobs-search?search=product%20manager&location=California&days=7
+```
 
-## Candidate matrix
+Use `days`, not `days_ago`. A live comparison showed `days=7` reducing the result count from 748 to 269 with recent cards first, while `days_ago=7` left the result set unchanged.
 
-| Candidate                                | Evidence                                                                                              |                                 Status | Decision                                                                         |
-| ---------------------------------------- | ----------------------------------------------------------------------------------------------------- | -------------------------------------: | -------------------------------------------------------------------------------- |
-| Camoufox page navigation + embedded JSON | Maintained JS implementation documents the payload shape; browser route addresses page-level blocking |                Selected implementation | Use as the only runtime source                                                   |
-| Plain HTTP search page                   | Local GET returned a Cloudflare challenge                                                             |                                Blocked | Not used alone                                                                   |
-| MCP `search_jobs`                        | Historical structured response, but current local requests returned HTTP 429                          |                            Unavailable | Removed from actor                                                               |
-| Mobile `/jobs-app/jobs`                  | Maintained Python implementation documents `continue`; local request returned HTTP 403 WAF            |                        Proxy-dependent | Removed from actor to keep one browser path                                      |
-| `jobspy-js` package                      | Active MIT package with ZipRecruiter support and TLS-aware page session                               |                        Valid reference | Ported its ZipRecruiter JSON mapping without adding its full multi-board runtime |
-| Old unofficial API wrappers              | Archived or obsolete API contracts                                                                    |                               Rejected | Not current                                                                      |
-| JobsPipe, JSearch, Adzuna                | Require credentials and may not preserve ZipRecruiter provenance                                      | Not suitable as an implicit dependency | Rejected                                                                         |
-| Arbeitnow, Remotive, Remote OK, USAJobs  | Free feeds but not ZipRecruiter-specific                                                              |                       Wrong provenance | Rejected                                                                         |
+## Response layout
 
-## Proxy policy
+The page is a Next.js server-rendered document. Job data is embedded in the React flight stream:
 
-The input uses the exact Apify `proxyConfiguration` key. The default cloud preference is `UNBLOCKER`. The actor does not construct proxy credentials, does not log proxy URLs, and does not pass a session ID to Unblocker. Custom proxy configurations are passed through `Actor.createProxyConfiguration()`. Camoufox receives the same proxy URL, but its optional `geoip` lookup is disabled because `camoufox-js` performs external public-IP requests that can fail certificate validation in the Apify runtime; WebRTC remains blocked.
+```text
+<script>self.__next_f.push([1,"..."])</script>
+```
 
-Local runs without Apify credentials intentionally run without the managed proxy and may receive a Cloudflare challenge. That is an environment limitation, not a reason to label a blocked smoke test as successful.
+Join every `self.__next_f.push` string in document order. The current job payload is a container object with these keys:
+
+```json
+{
+    "jobKeys": [{ "listingKey": "...", "matchId": "..." }],
+    "jobCards": [{ "listingKey": "...", "title": "...", "company": { "name": "..." } }],
+    "totalListings": 761,
+    "extensions": { "breakroom": {} },
+    "placementId": 44072
+}
+```
+
+Search metadata is stored in a nearby flight row:
+
+```json
+{ "requesterCountryCode": "PK", "jobCount": 761, "pageNumber": 1 }
+```
+
+A `GetJobDetailsResponse` is also present for one listing:
+
+```json
+{
+    "$typeName": "job_services.job_card.api_public.public.api.v1.GetJobDetailsResponse",
+    "rsp": { "jobDetails": { "listingKey": "...", "htmlFullDescription": "$36" } }
+}
+```
+
+`$36` is an unresolved flight reference, not a description. It is rejected by the output mapper. The actor uses `shortDescription` from each card for fast listing-only extraction.
+
+### Payload markers in priority order
+
+1. `jobCards` array inside a flight container also containing `jobKeys` and `totalListings`.
+2. Legacy `serializedJobCardsData.jobKeysMap` + `jobKeys` array.
+3. Legacy `hydrateJobCardsResponse.jobCards` embedded JSON.
+4. `application/ld+json` `ItemList` fallback. This only has title and URL, so it is a last resort.
+
+The extractor walks backwards from `"jobCards"` and accepts the first balanced object that contains a non-empty `jobCards` array. Field order changes do not break this lookup.
+
+## Available fields
+
+Each card currently provides:
+
+`listingKey`, `matchId`, `title`, `benefits`, `employmentTypes`, `enhancementTypes`, `locationTypes`, `shortDescription`, `saved`, `locationUrl`, `companyUrl`, `isNew`, `companyLogoUrl` (sometimes), `companyLogo`, `jobRedirectPageUrl`, `rawCanonicalZipJobPageUrl`, `openSeatId`, `seoJobRedirectPageUrl`, `shareShortUrl`, `htmlFullDescription` (usually empty), `status`, `pay`, `company`, `location`, `applyButtonConfig`, `buttonConfig`, `display`, `updatedAt`.
+
+Human-readable values are duplicated in `display`:
+
+- `display.location` — `Manhattan, NY`
+- `display.employmentTypes.fullDisplay` — `Full-time`
+- `display.locationTypesV2.fullDisplay` — `On-site`
+- `display.benefits` — `Medical, Dental, Vision, Life, Retirement, PTO`
+- `display.rollingPostedAt` — `18 days ago`
+- `display.pay.text` — salary text when the source publishes one
+
+Timestamps use protobuf objects:
+
+```json
+{ "seconds": "1788418800", "nanos": 0 }
+```
+
+## Browser profile matrix
+
+Same URL and same headers, one request per profile, no proxy, 2026-10-21:
+
+| Profile                                            |        Status |   Body | Job cards | Decision                 |
+| -------------------------------------------------- | ------------: | -----: | --------- | ------------------------ |
+| `firefox`                                          |           200 | 749 KB | yes       | selected primary         |
+| `firefox128`                                       |           200 | 746 KB | yes       | fallback                 |
+| `firefox133`                                       |           200 | 746 KB | yes       | fallback                 |
+| `chrome125`                                        |           200 | 750 KB | yes       | fallback                 |
+| `chrome`                                           |           403 |   6 KB | no        | rejected (challenge)     |
+| `chrome124`                                        |           403 |   6 KB | no        | rejected (challenge)     |
+| `chrome131`, `chrome136`, `chrome142`, `chrome151` |           403 |   6 KB | no        | rejected (challenge)     |
+| `chrome100`–`chrome116`                            | connect error |      — | no        | rejected (TLS handshake) |
+| `firefox135`, `firefox144`                         |           403 |   6 KB | no        | rejected (challenge)     |
+| `okhttp`, `okhttp3`, `okhttp4`, `okhttp5`          |           403 | 5.7 KB | no        | rejected (challenge)     |
+| `ios18`                                            | connect error |      — | no        | rejected (TLS handshake) |
+
+Repeat test: five consecutive requests on the `firefox` profile all returned HTTP 200 and a full payload.
+
+## Rejected sources
+
+| Candidate                                             | Result                                      | Why rejected                                                                  |
+| ----------------------------------------------------- | ------------------------------------------- | ----------------------------------------------------------------------------- |
+| `https://api.ziprecruiter.com/jobs/v1?...api_key=...` | HTTP 404 HTML error page                    | Public publisher key from old tutorials no longer maps to this endpoint       |
+| `https://www.ziprecruiter.com/candidate/search`       | 200 but geolocated to the requester country | Legacy route ignores the supplied location in this environment                |
+| Chrome, okhttp, iOS profiles                          | 403 or TLS failure                          | Cloudflare rejects these fingerprints for this endpoint                       |
+| Playwright/Chromium browser rendering                 | Works but slow and resource-heavy           | The direct HTTP payload contains the same cards, so a browser is not required |
+
+## Cloud validation
+
+The first Apify cloud run used the default input (search URL only) with US residential Apify Proxy. It returned HTTP 200, parsed 20 cards, and pushed the requested records with no browser step. A run using `UNBLOCKER` was rejected by the account before startup (`You currently do not have access to proxy groups: UNBLOCKER`), so the actor default is `RESIDENTIAL` with `apifyProxyCountry: US`.
+
+Profile rotation was observed in production behavior: page 1 was served by `firefox`, page 2 by `firefox128` after `firefox` returned HTTP 200 without a job payload. The run completed with 25 unique records. A later prefill-only run (the Store health-test input) completed in 3 seconds with 20 records and status `SUCCEEDED`.
+
+Proxy-country check: US residential (`apifyProxyCountry: US`) completed a 40-record, 2-page run in 12 seconds. The same run without a country completed 10 records in 43 seconds, so the default keeps `US` for speed and consistency. Any residential exit can work, but non-US exits triggered more hidden retries.
+
+## Session recovery
+
+Each page request can use up to six proxy sessions (initial session plus five rotations) across the four verified profiles. Retry selection is:
+
+1. Keep the profile that last succeeded in first position.
+2. If that profile is challenged or returns an unusable page, rotate the proxy once before demoting it.
+3. If it still fails, try the remaining profiles on the new session.
+4. Continue rotating sessions until a usable payload is returned or the three-minute per-page budget is exhausted.
+5. When a later page cannot be recovered, keep the already-saved records and finish with `stopReason: partial_failure` instead of failing the whole run.
+
+A 10-page `admin` / `New York` run completed 195 unique records in 26 seconds with no challenge warnings in the run log.
+
+## Failure diagnostics
+
+When a request fails, read this section before changing code:
+
+1. `HTTP 403` with `Just a moment...` means the profile or IP was challenged. Rotate to the next working Firefox profile, then rotate the proxy session.
+2. `HTTP 429` means rate limiting. Honor `Retry-After`, then retry with bounded backoff.
+3. `HTTP 200` without a `jobCards` marker means the payload changed. Check whether the flight stream still exists, whether the container keys changed, and whether a new response layout is present.
+4. `HTTP 200` with an empty `jobCards` array means the query matched no listings. Stop pagination; this is not an error.
+5. WebSocket, gRPC, or GraphQL endpoints found in the browser are not required for this flow. Do not replace the working server-rendered payload with a speculative endpoint.
+6. A `requesterCountryCode` different from `US` is expected when the proxy exit is outside the US. The requested `location` parameter still controls the result set.
 
 ## Validation requirements
 
-A release run must confirm:
-
-- Apify run starts with a usable Unblocker route.
-- The first page contains either `serializedJobCardsData.jobKeysMap` or the older `hydrateJobCardsResponse.jobCards` payload; rendered-card fallback is only accepted when job cards are present.
-- Dataset is non-empty for a search known to have matches.
-- `maxJobs` is respected.
-- `maxPages` and the payload's `maxPages` stop pagination.
-- Duplicate listing keys are not emitted twice.
-- Arrays and numeric salary fields retain their declared types.
-- No credentials, cookies, full responses, or proxy URLs appear in logs.
+- `GET /jobs-search` returns a `self.__next_f.push` flight stream.
+- The stream contains a non-empty `jobCards` array.
+- `pageNumber` matches the requested page.
+- `jobCount` or `totalListings` provides the page-count bound.
+- Card `listingKey` is stable across pages and used for deduplication.
+- At least one card exposes `title`, `company.name`, `location`, and `rawCanonicalZipJobPageUrl`.
+- `accept` is the navigation HTML accept header.
+- The transport uses one of the four verified profiles.

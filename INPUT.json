@@ -1,8 +1,7 @@
 {
     "searchQuery": "software engineer",
-    "location": "United States",
+    "location": "New York, NY",
     "maxJobs": 5,
     "maxPages": 2,
-    "scrapeMode": "listing_only",
     "daysBack": "any"
 }

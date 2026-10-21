@@ -4,56 +4,44 @@
     "schemaVersion": 1,
     "properties": {
         "searchUrl": {
-            "title": "Search URL (Optional)",
+            "title": "Search URL",
             "type": "string",
-            "description": "Direct ZipRecruiter search URL. When supplied, it is the only search mode used and other search filters are ignored.",
-            "editor": "textfield"
+            "description": "ZipRecruiter search results URL. It is used when no searchQuery or location is supplied. Precedence: searchQuery, then location, then searchUrl.",
+            "editor": "textfield",
+            "default": "https://www.ziprecruiter.com/jobs-search?search=software+engineer&location=United+States",
+            "prefill": "https://www.ziprecruiter.com/jobs-search?search=software+engineer&location=United+States"
         },
         "searchQuery": {
             "title": "Search Query / Keywords",
             "type": "string",
-            "description": "Job title or keywords to search for. Use this when searchUrl is not supplied.",
-            "editor": "textfield",
-            "prefill": "software engineer"
+            "description": "Job title or keywords to search for. Takes precedence over location and searchUrl.",
+            "editor": "textfield"
         },
         "location": {
             "title": "Location",
             "type": "string",
-            "description": "Optional location filter, such as New York, NY, California, or Remote.",
-            "editor": "textfield",
-            "prefill": "United States"
+            "description": "Optional location filter, such as New York, NY, California, or Remote. Takes precedence over searchUrl when searchQuery is empty.",
+            "editor": "textfield"
         },
         "maxJobs": {
             "title": "Maximum Jobs",
             "type": "integer",
             "description": "Maximum number of job listings to save. Use 0 to continue until the page limit or source results are exhausted.",
             "default": 20,
-            "prefill": 20,
             "minimum": 0
         },
         "maxPages": {
             "title": "Maximum Pages",
             "type": "integer",
-            "description": "Maximum number of result pages or continuation batches to request.",
+            "description": "Maximum number of result pages to request.",
             "default": 10,
-            "prefill": 10,
             "minimum": 1
-        },
-        "scrapeMode": {
-            "title": "Scrape Mode",
-            "type": "string",
-            "description": "listing_only is fastest. listing_with_details is retained for compatibility and includes descriptions when the source provides them.",
-            "default": "listing_only",
-            "prefill": "listing_only",
-            "enum": ["listing_only", "listing_with_details"],
-            "enumTitles": ["Listing Only (Fast)", "Listing + Available Details"]
         },
         "daysBack": {
             "title": "Posted Within (Days)",
             "type": "string",
             "description": "Restrict results to recent postings.",
             "default": "any",
-            "prefill": "any",
             "enum": ["any", "1", "3", "7", "14", "30"],
             "enumTitles": ["Any time", "Last 24 hours", "Last 3 days", "Last 7 days", "Last 14 days", "Last 30 days"]
         },
@@ -64,12 +52,7 @@
             "editor": "proxy",
             "default": {
                 "useApifyProxy": true,
-                "apifyProxyGroups": ["UNBLOCKER"],
-                "apifyProxyCountry": "US"
-            },
-            "prefill": {
-                "useApifyProxy": true,
-                "apifyProxyGroups": ["UNBLOCKER"],
+                "apifyProxyGroups": ["RESIDENTIAL"],
                 "apifyProxyCountry": "US"
             }
         }

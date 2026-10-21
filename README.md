@@ -7,7 +7,8 @@ This Actor is designed for hiring research, recruiting workflows, job market mon
 ## Why use ZipRecruiter Jobs Scraper?
 
 - **Search-focused collection** - Use a keyword, location, or an existing ZipRecruiter results URL.
-- **Useful hiring fields** - Collect compensation, employment type, work style, descriptions, logos, and apply links when available.
+- **Useful hiring fields** - Collect compensation, employment type, work style, short descriptions, logos, and apply links when available.
+- **Fast listing extraction** - Collects job cards directly from result pages without per-job detail requests.
 - **Freshness controls** - Restrict collection to postings from the last day, 3 days, 7 days, 14 days, or 30 days.
 - **Duplicate protection** - Repeated listings are removed using stable listing identifiers or job URLs.
 - **Fast dataset delivery** - Records are saved as result pages are processed instead of waiting for the entire run.
@@ -29,7 +30,7 @@ This Actor is designed for hiring research, recruiting workflows, job market mon
 | `salaryInterval`                      | String  | Compensation interval such as hourly, monthly, or annual.     |
 | `salaryMinAnnual` / `salaryMaxAnnual` | Number  | Annualized compensation when conversion is possible.          |
 | `salaryCurrency`                      | String  | Compensation currency.                                        |
-| `description`                         | String  | Full or available job description.                            |
+| `description`                         | String  | Full description when supplied by the listing payload.        |
 | `shortDescription`                    | String  | Short listing summary when available.                         |
 | `benefits`                            | String  | Benefits text when published.                                 |
 | `postedDate`                          | String  | Published posting timestamp or date.                          |
@@ -46,28 +47,29 @@ This Actor is designed for hiring research, recruiting workflows, job market mon
 | `offset`                              | Number  | First-page offset when supplied by the source.                |
 | `scrapedAt`                           | String  | ISO timestamp for collection.                                 |
 
+Each record also includes additional listing metadata when ZipRecruiter publishes it: `matchId`, `isActive`, `isNew`, `salarySource`, `companyId`, `companyCanonicalName`, `companyUrl`, `companyLogoSource`, `locationCity`, `locationState`, `locationStateCode`, `locationCountry`, `locationCountryCode`, `locationCounty`, `locationLocId`, `locationGranularity`, `locationAreaSize`, `locationUrl`, `applyType`, `applyDestination`, `jobRedirectPageUrl`, `seoJobRedirectPageUrl`, `shareShortUrl`, `openSeatId`, `displayPay`, `displayLocationTypes`, `rollingPostedAt`, `postedTime`, and `updatedAt`.
+
 ## How to use the Actor
 
 1. Open the Actor in Apify Console.
-2. Enter either a ZipRecruiter `searchUrl` or a `searchQuery` with an optional `location`.
+2. Enter a `searchQuery` with an optional `location`, or leave both empty to use the default `searchUrl`.
 3. Set the number of jobs and maximum pages.
 4. Choose an optional posting-age filter.
 5. Run the Actor and download the dataset or connect it to your workflow.
 
-ZipRecruiter can restrict datacenter traffic. The default proxy preference uses Apify Unblocker for cloud runs. A US residential route can also be useful for workflows that require a geographically consistent connection. Proxy availability and target access can vary by run.
+ZipRecruiter can restrict datacenter traffic. The default proxy preference uses US residential Apify Proxy for cloud runs. Proxy availability and target access can vary by run.
 
 ## Input Parameters
 
-| Parameter            | Type    | Required | Default         | Description                                                                                                                                   |
-| -------------------- | ------- | -------- | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `searchUrl`          | String  | No       | -               | ZipRecruiter search URL. When supplied, it is the only search mode used and other search fields are ignored.                                  |
-| `searchQuery`        | String  | No       | -               | Job title or keyword search. Use this when `searchUrl` is not supplied.                                                                       |
-| `location`           | String  | No       | -               | Optional city, state, country, or remote location filter.                                                                                     |
-| `maxJobs`            | Integer | No       | `20`            | Maximum jobs to save. Use `0` to continue until page limits or source results are exhausted.                                                  |
-| `maxPages`           | Integer | No       | `10`            | Maximum result pages to open.                                                                                                                 |
-| `scrapeMode`         | String  | No       | `listing_only`  | `listing_only` is fastest. `listing_with_details` is retained for compatibility and includes descriptions when available in the listing data. |
-| `daysBack`           | String  | No       | `any`           | Allowed values: `any`, `1`, `3`, `7`, `14`, or `30`.                                                                                          |
-| `proxyConfiguration` | Object  | No       | Apify Unblocker | Apify Proxy configuration. Unblocker is recommended for ZipRecruiter access.                                                                  |
+| Parameter            | Type    | Required | Default                                | Description                                                                                  |
+| -------------------- | ------- | -------- | -------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `searchUrl`          | String  | No       | Software engineer in the United States | ZipRecruiter search URL. Used when `searchQuery` and `location` are empty.                   |
+| `searchQuery`        | String  | No       | -                                      | Job title or keyword search. Takes precedence over `location` and `searchUrl`.               |
+| `location`           | String  | No       | -                                      | Optional city, state, country, or remote location filter. Takes precedence over `searchUrl`. |
+| `maxJobs`            | Integer | No       | `20`                                   | Maximum jobs to save. Use `0` to continue until page limits or source results are exhausted. |
+| `maxPages`           | Integer | No       | `10`                                   | Maximum result pages to open.                                                                |
+| `daysBack`           | String  | No       | `any`                                  | Allowed values: `any`, `1`, `3`, `7`, `14`, or `30`.                                         |
+| `proxyConfiguration` | Object  | No       | US residential Apify Proxy             | Apify Proxy configuration. Residential access is recommended for ZipRecruiter.               |
 
 ## Usage Examples
 
@@ -86,7 +88,7 @@ Collect software engineering jobs in New York:
 
 ### Use a ZipRecruiter search URL
 
-Provide a URL copied from a ZipRecruiter results page. The URL takes precedence over keyword and location fields:
+Provide a URL copied from a ZipRecruiter results page. The URL is used when no keyword or location is supplied:
 
 ```json
 {
@@ -96,9 +98,9 @@ Provide a URL copied from a ZipRecruiter results page. The URL takes precedence 
 }
 ```
 
-### Recent jobs with Unblocker
+### Recent jobs with residential proxies
 
-Collect fresh product manager jobs through Apify Unblocker:
+Collect fresh product manager jobs through US residential Apify Proxy:
 
 ```json
 {
@@ -109,7 +111,7 @@ Collect fresh product manager jobs through Apify Unblocker:
     "maxPages": 20,
     "proxyConfiguration": {
         "useApifyProxy": true,
-        "apifyProxyGroups": ["UNBLOCKER"]
+        "apifyProxyGroups": ["RESIDENTIAL"]
     }
 }
 ```
@@ -138,8 +140,8 @@ Collect fresh product manager jobs through Apify Unblocker:
     "url": "https://www.ziprecruiter.com/jobs//j?lvk=example-listing",
     "externalApplyUrl": "https://careers.example.com/jobs/example-listing",
     "listingKey": "example-listing",
-    "source": "ziprecruiter_camoufox_json",
-    "provider": "ziprecruiter_camoufox_json",
+    "source": "ziprecruiter_json",
+    "provider": "ziprecruiter_json",
     "searchQuery": "software engineer",
     "searchLocation": "Austin, TX",
     "page": 1,
@@ -154,7 +156,7 @@ Collect fresh product manager jobs through Apify Unblocker:
 - Add a city, state, or country to reduce unrelated results.
 - Start with `maxJobs` between 5 and 20 when checking a new search.
 - Use `daysBack` for recurring hiring alerts and monitoring.
-- Keep the Unblocker preference enabled for cloud runs when ZipRecruiter restricts direct access.
+- Keep the US residential proxy preference enabled for cloud runs when ZipRecruiter restricts direct access.
 - Review several records before treating missing salary, benefits, or logo values as an extraction issue. Those fields are optional on the source listing.
 - Use a moderate `maxPages` value for scheduled runs and increase it only when you need a larger snapshot.
 
@@ -175,7 +177,7 @@ Apify datasets can be used with:
 
 ### Do I need both `searchUrl` and `searchQuery`?
 
-No. Use `searchUrl` by itself, or use `searchQuery` with an optional `location`. When `searchUrl` is supplied, it takes precedence over the other search fields.
+No. Use `searchQuery` with an optional `location`, or use `searchUrl` by itself. When `searchQuery` is supplied it takes precedence, then `location`, then `searchUrl`.
 
 ### How many jobs can I collect?
 
@@ -187,15 +189,11 @@ Yes. Set `daysBack` to `1`, `3`, `7`, `14`, or `30`.
 
 ### Why does a run need a proxy?
 
-ZipRecruiter may restrict datacenter traffic. Apify Unblocker is the default cloud preference because it is intended for pages that need managed access routing. No proxy service guarantees access to every target response.
+ZipRecruiter may restrict datacenter traffic. US residential Apify Proxy is the default cloud preference because it provides geographically consistent access. No proxy service guarantees access to every target response.
 
 ### Why are some fields missing?
 
 Some job postings do not publish salary, benefits, company logos, descriptions, or external application links. Empty values are omitted from the dataset.
-
-### Does `listing_with_details` crawl every job page?
-
-No. The compatibility mode retains the input option and includes descriptions when they are already available in the listing data. It does not make a slow detail request for every job.
 
 ### Can I schedule this Actor?
 

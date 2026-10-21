@@ -1,12 +1,13 @@
-# Camoufox-compatible Apify image with the matching Firefox runtime.
-FROM apify/actor-node-playwright-camoufox:24-1.60.0
+# HTTP-only actor: the ZipRecruiter page payload is fetched directly with impit.
+FROM apify/actor-node:22
 
-COPY --chown=myuser:myuser package*.json Dockerfile ./
+COPY --chown=myuser:myuser package*.json ./
 
 RUN npm --quiet set progress=false \
     && npm install --omit=dev \
-    && node -e "import('camoufox-js').then(m => console.log('camoufox-js OK:', Object.keys(m)))" \
-    && node -e "import('playwright').then(m => console.log('playwright OK:', m.firefox ? 'firefox available' : 'firefox missing'))" \
+    && node -e "import('impit').then(m => console.log('impit OK:', Object.keys(m)))" \
+    && echo "Installed NPM packages:" \
+    && (npm list --omit=dev --all || true) \
     && echo "Node.js version:" \
     && node --version \
     && echo "NPM version:" \
