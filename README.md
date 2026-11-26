@@ -203,6 +203,17 @@ Yes. Create an Apify schedule to refresh a search hourly, daily, weekly, or on a
 
 Yes. Apify provides CSV, Excel, JSON, and other dataset export formats.
 
+## Run locally
+
+Requires Python 3.12 or newer.
+
+```bash
+pip install -r requirements.txt
+python -m src
+```
+
+Local input is read from `storage/key_value_stores/default/INPUT.json`. Parser tests: `python -m unittest discover -s test`.
+
 ## Support
 
 For issues or feature requests, use the support and issue channels available for this Actor in Apify Console.

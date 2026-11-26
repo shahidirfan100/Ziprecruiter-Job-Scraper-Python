@@ -1,15 +1,15 @@
-# configurations
+# This file tells Docker which files and directories should not be copied to the image.
 .idea
 .vscode
 .zed
-
-# crawlee and apify storage folders
+.DS_Store
+.git
+.gitignore
+node_modules
+storage
 apify_storage
 crawlee_storage
-storage
-
-# installed files
-node_modules
-
-# git folder
-.git
+.venv
+__pycache__
+*.pyc
+.env

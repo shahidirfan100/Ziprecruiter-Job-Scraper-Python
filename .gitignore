@@ -5,9 +5,9 @@
 .vscode
 .zed
 dist
-node_modules
-apify_storage
+__pycache__
+*.pyc
+.venv
 storage
-package-lock.json
-src/main.browser-pagination.backup.js
-backup/RESTORE-INSTRUCTIONS.txt
+apify_storage
+.env

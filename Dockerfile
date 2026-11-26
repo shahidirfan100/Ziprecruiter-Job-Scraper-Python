@@ -1,19 +1,11 @@
-# HTTP-only actor: the ZipRecruiter page payload is fetched directly with impit.
-FROM apify/actor-node:22
+# HTTP-only actor: the ZipRecruiter page payload is fetched directly with Scrapling.
+FROM apify/actor-python:3.13
 
-COPY --chown=myuser:myuser package*.json ./
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
-RUN npm --quiet set progress=false \
-    && npm install --omit=dev \
-    && node -e "import('impit').then(m => console.log('impit OK:', Object.keys(m)))" \
-    && echo "Installed NPM packages:" \
-    && (npm list --omit=dev --all || true) \
-    && echo "Node.js version:" \
-    && node --version \
-    && echo "NPM version:" \
-    && npm --version \
-    && rm -r ~/.npm
+COPY . ./
 
-COPY --chown=myuser:myuser . ./
+RUN python -m compileall -q src/
 
-CMD ["node", "src/main.js"]
+CMD ["python", "-m", "src"]
