@@ -165,6 +165,24 @@ A browser fetcher (Scrapling `StealthyFetcher` / Camoufox, both installed in thi
 | Chrome, okhttp, iOS profiles                          | 403 or TLS failure                          | Cloudflare rejects these fingerprints for this endpoint                       |
 | Playwright/Chromium browser rendering                 | Works but slow and resource-heavy           | The direct HTTP payload contains the same cards, so a browser is not required |
 
+## Proxy country matrix
+
+`RESIDENTIAL` group, 5 jobs, one page, 2026-11-26, Python build 1.0.14. Each row is a separate cloud run with `apifyProxyCountry` set explicitly:
+
+| Country | Runs | Result |
+| --- | ---: | --- |
+| US | 8 | all `SUCCEEDED` (0–13 blocked responses, 2–44 s) |
+| CA | 2 | 1 `SUCCEEDED` (5 blocked, 2 rotations); 1 `FAILED` |
+| GB | 2 | both `FAILED` |
+| DE | 2 | both `FAILED` |
+| AU | 1 | `FAILED` |
+
+Every failure was the same shape: page 1 returned the Cloudflare challenge for all profiles on all six sessions and the run stopped with `RuntimeError: result page 1 was blocked with HTTP 403`. No run failed for missing proxy capacity. ZipRecruiter is a US job board, so non-US residential exits are challenged consistently; the US pool works, with per-exit variance that the rotation loop absorbs.
+
+The actor therefore keeps `RESIDENTIAL` + `apifyProxyCountry: US` as the default, and `proxyInputForSearch` still forces US when a US location is searched and no country was picked. Explicitly choosing GB, DE, AU (or any other non-US country) is allowed but currently produces failed runs.
+
+Multi-page check (US, `maxJobs: 40`, `maxPages: 3`, run `GgoZRUZxUpbXkuacw`): 40 records from pages 1–2, 40 unique listing keys, 13 blocked responses, 4 rotations, 29 s, `stopReason: target_reached`.
+
 ## Cloud validation
 
 Python actor, US residential Apify Proxy, 2026-11-26:
@@ -176,6 +194,7 @@ Python actor, US residential Apify Proxy, 2026-11-26:
 | 1.0.11 | `9wJRXn2Kg32iSbkFo` | keyword, `maxJobs: 5` | `SUCCEEDED`, 5 records, 44 s, 18 blocked, 5 proxy rotations, `{"chrome": 6, "chrome150": 5, "safari": 4, "firefox": 4}` |
 | 1.0.12 | `kc4MHoBnaLPAuNBLb` | keyword, `maxJobs: 5` | `SUCCEEDED`, 5 records, 2 s, 0 blocked, 0 rotations, `{"chrome": 1}` |
 | 1.0.13 | `vogT8WYP2GJCqOm0n` | keyword, `maxJobs: 5` | `SUCCEEDED`, 5 records, 18 s, 13 blocked, 4 rotations, `{"chrome": 5, "chrome150": 3, "safari": 3, "firefox": 3}` |
+| 1.0.14 | `GgoZRUZxUpbXkuacw` | keyword, `maxJobs: 40`, `maxPages: 3` | `SUCCEEDED`, 40 records from 2 pages, 29 s, 13 blocked, 4 rotations |
 
 The third run is the important one for access: every profile was challenged on the first proxy exits, all five rotations were used, and the loop still returned a payload and pushed the requested records. No browser step in any run.
 
