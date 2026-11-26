@@ -183,6 +183,24 @@ The actor therefore keeps `RESIDENTIAL` + `apifyProxyCountry: US` as the default
 
 Multi-page check (US, `maxJobs: 40`, `maxPages: 3`, run `GgoZRUZxUpbXkuacw`): 40 records from pages 1–2, 40 unique listing keys, 13 blocked responses, 4 rotations, 29 s, `stopReason: target_reached`.
 
+## Node impit vs Python curl_cffi (2026-11-26)
+
+Same actor, same input (`maxJobs: 5`), same US residential proxy, back-to-back cloud runs:
+
+| Build | Transport | Result |
+| --- | --- | --- |
+| 1.0.9 (Node) | impit 0.14.6, `firefox` → `firefox128` → `firefox133` → `chrome125` | `FAILED` after 47 s: `result page 1 was blocked with HTTP 403` |
+| 1.0.15 (Python) | Scrapling / curl_cffi, `chrome` | `SUCCEEDED` in 2 s, 5 records, 0 blocked |
+
+Direct-connection profile sweep in the same window (residential PK IP, navigation headers):
+
+| Engine | Profiles returning job cards |
+| --- | --- |
+| impit 0.14.6 (Node) | none of `firefox`, `firefox128`, `firefox133`, `chrome125`, `chrome`, `chrome131`, `chrome136`, `chrome142`, `chrome151` |
+| curl_cffi 0.17 (Python) | `chrome` (HTTP 200, 721 KB); `firefox` 403 |
+
+The difference is the impersonation profile, not the language: impit's Chrome hello is not accepted while curl_cffi's is, and the old actor's Firefox-first order is dead today. Do not roll back to build 1.0.9. impit's Firefox variant returns a 77 KB partial page with a flight stream but no `jobCards`, which is why the actor checks both status and payload instead of trusting HTTP 200.
+
 ## Cloud validation
 
 Python actor, US residential Apify Proxy, 2026-11-26:
