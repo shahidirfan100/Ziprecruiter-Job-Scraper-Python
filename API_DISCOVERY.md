@@ -175,6 +175,7 @@ Python actor, US residential Apify Proxy, 2026-11-26:
 | 1.0.10 | `ithPrQ2f3NAKPb9HP` | `{}` (search URL prefill, the Store health test) | `SUCCEEDED`, 20 records, 16 s, 4 blocked, 1 transport error, 2 proxy rotations, `{"chrome": 3, "chrome150": 1, "safari": 1}` |
 | 1.0.11 | `9wJRXn2Kg32iSbkFo` | keyword, `maxJobs: 5` | `SUCCEEDED`, 5 records, 44 s, 18 blocked, 5 proxy rotations, `{"chrome": 6, "chrome150": 5, "safari": 4, "firefox": 4}` |
 | 1.0.12 | `kc4MHoBnaLPAuNBLb` | keyword, `maxJobs: 5` | `SUCCEEDED`, 5 records, 2 s, 0 blocked, 0 rotations, `{"chrome": 1}` |
+| 1.0.13 | `vogT8WYP2GJCqOm0n` | keyword, `maxJobs: 5` | `SUCCEEDED`, 5 records, 18 s, 13 blocked, 4 rotations, `{"chrome": 5, "chrome150": 3, "safari": 3, "firefox": 3}` |
 
 The third run is the important one for access: every profile was challenged on the first proxy exits, all five rotations were used, and the loop still returned a payload and pushed the requested records. No browser step in any run.
 
